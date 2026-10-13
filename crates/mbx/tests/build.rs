@@ -3534,6 +3534,51 @@ fn a_compilation_that_reads_out_dir_shares_between_checkouts_with_the_same_gener
     }
 }
 
+/// A build script may declare a dependence on `OUT_DIR` itself, as the
+/// `build-rs` crate does. The shim swaps `OUT_DIR` for a stable copy while
+/// rustc runs, and the declaration must neither read as a changed input nor
+/// key the compilation to its checkout.
+#[test]
+fn a_build_script_depending_on_out_dir_shares_between_checkouts() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let settings = [
+        ("MBX_CACHE_LINKS", "0"),
+        ("MBX_BUILD_SCRIPT_EXECUTION", "0"),
+    ];
+    let mut hits = 0;
+    for name in ["first", "second"] {
+        let project = tempfile::tempdir().unwrap();
+        write_generated_project(project.path(), Generated::Include);
+        let script = project.path().join("build.rs");
+        let source = std::fs::read_to_string(&script).unwrap().replace(
+            "fn main() {",
+            "fn main() {\n    println!(\"cargo::rerun-if-env-changed=OUT_DIR\");",
+        );
+        std::fs::write(&script, source).unwrap();
+        let (stats, stderr) = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{name}.json")),
+            &settings,
+        );
+        assert!(
+            !stderr.contains("compilation result was discarded"),
+            "{stderr}"
+        );
+        hits = count(&stats, "hits");
+    }
+    assert!(hits > 0, "the second checkout reused nothing");
+    // The generated build script's own compilation hits either way, so the
+    // OUT_DIR reader is checked by crate.
+    let outcomes = second_build_outcomes(store.path());
+    assert_eq!(
+        outcomes.get("fixture").map(String::as_str),
+        Some("hit"),
+        "the OUT_DIR reader recompiled: {outcomes:?}"
+    );
+}
+
 /// Generated sources that differ between checkouts are different inputs, and
 /// the compilation that reads them is keyed to its own.
 #[test]
