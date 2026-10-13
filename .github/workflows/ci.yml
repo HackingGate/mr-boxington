@@ -134,6 +134,7 @@ jobs:
         if: runner.os != 'Windows'
         env:
           MBX_BIN: ${{ github.workspace }}/target/mbx-bootstrap/mbx
+          MISE_GITHUB_TOKEN: ${{ github.token }}
         run: test/bats/bin/bats test
       - name: Windows end-to-end tests
         if: runner.os == 'Windows'
