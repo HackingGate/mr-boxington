@@ -1841,6 +1841,44 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
+/// Whether running `compiler` really runs some other program whose memory
+/// is not the compile's: Cargo's earlier `RUSTC_WRAPPER`, which wraps every
+/// compiler call, or a workspace wrapper other than clippy-driver. Under
+/// `cargo clippy` the workspace wrapper is recorded for the whole build, but
+/// dependencies still run the real rustc, and clippy-driver compiles in its
+/// own process, so both measure a real compile.
+pub(crate) fn compiler_runs_through_wrapper(compiler: &OsStr) -> bool {
+    compiler_runs_through_wrapper_using(compiler, |name| std::env::var_os(name))
+}
+
+fn compiler_runs_through_wrapper_using(
+    compiler: &OsStr,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> bool {
+    get(PREVIOUS_RUSTC_WRAPPER_ENV).is_some()
+        || (!is_clippy_driver(compiler)
+            && get(PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV).is_some_and(|wrapper| wrapper == compiler))
+}
+
+pub(crate) fn is_clippy_driver(compiler: &OsStr) -> bool {
+    executable_stem(compiler) == Some("clippy-driver")
+}
+
+fn transparent_compiler_demand(
+    name: &str,
+    described: &[OsString],
+    incremental_flag: Option<&OsStr>,
+    wrapped: bool,
+    clippy: bool,
+) -> crate::scheduler::Demand {
+    crate::scheduler::Demand::new(name, links_natively(described)).with_compiler_execution(
+        described,
+        incremental_flag,
+        wrapped,
+        clippy,
+    )
+}
+
 /// Run the compiler without caching. `described` is `arguments` with any
 /// `@argfile` expanded, which is where to look for what is being compiled;
 /// rustc itself is given `arguments` unchanged.
@@ -1866,8 +1904,17 @@ fn run_transparent_rustc(
                 .to_str()
                 .is_some_and(|argument| argument.starts_with("--print"))
     });
+    let incremental_flag = bypassed
+        .then(|| crate::rustc::bypassed_library_incremental_flag(described))
+        .flatten();
     let demand = crate_name.as_deref().filter(|_| !is_query).map(|name| {
-        crate::scheduler::Demand::new(name, links_natively(described)).with_link_profile(described)
+        transparent_compiler_demand(
+            name,
+            described,
+            incremental_flag.as_deref(),
+            compiler_runs_through_wrapper(&rustc),
+            is_clippy_driver(&rustc),
+        )
     });
     let permit = demand
         .as_ref()
@@ -1885,7 +1932,7 @@ fn run_transparent_rustc(
         Command::new(&rustc)
     };
     command.args(&arguments);
-    if bypassed && let Some(flag) = crate::rustc::bypassed_library_incremental_flag(described) {
+    if let Some(flag) = incremental_flag {
         command.arg(flag);
     }
     command.env_remove(PREVIOUS_RUSTC_WRAPPER_ENV);

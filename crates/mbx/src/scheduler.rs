@@ -238,6 +238,9 @@ pub(crate) struct Demand {
     profile: Option<String>,
     /// A nextest test whose measurements belong in its separate history file.
     per_test: Option<TestIdentity>,
+    compile_mode: Option<String>,
+    /// Another wrapper may have returned a cache hit without running rustc.
+    count_compile_samples: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,12 +261,13 @@ impl Demand {
             threads: Some(1),
             learns_cpu: false,
             profile: None,
+            compile_mode: None,
+            count_compile_samples: true,
             per_test: None,
         }
     }
 
-    /// Remember a link apart from the same crate's links under other
-    /// code-generation settings.
+    /// Remember links by code-generation profile and non-links by compile mode.
     ///
     /// A release build with fat LTO and one codegen unit peaks several times
     /// higher than a dev link of the same binary, and the ledger never lowers
@@ -275,8 +279,50 @@ impl Demand {
             let profile = link_profile(arguments);
             self.name = format!("{} [{profile}]", self.name);
             self.profile = Some(profile);
+        } else {
+            self.compile_mode = Some(format!(
+                "{} [compile {}]",
+                self.name,
+                compile_profile(arguments)
+            ));
         }
         self
+    }
+
+    /// Build the mode from the effective compiler flags, including a private
+    /// flag appended by mbx after argument parsing. Wrapper RSS can raise a
+    /// peak, but cannot establish a successful real-compiler sample.
+    pub(crate) fn with_compiler_execution(
+        mut self,
+        arguments: &[std::ffi::OsString],
+        appended_flag: Option<&std::ffi::OsStr>,
+        wrapped: bool,
+        clippy: bool,
+    ) -> Self {
+        let mut effective = arguments.to_vec();
+        effective.extend(appended_flag.map(std::ffi::OsStr::to_os_string));
+        self.count_compile_samples = !wrapped;
+        let mut demand = self.with_link_profile(&effective);
+        // Clippy runs lint passes a plain check does not, so it learns its own
+        // estimate rather than borrowing one from `cargo check`.
+        if clippy && demand.compile_mode.is_some() {
+            demand.compile_mode = Some(format!(
+                "{} [compile clippy {}]",
+                demand.name,
+                compile_profile(&effective)
+            ));
+        }
+        demand
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compile_mode_key(&self) -> Option<&str> {
+        self.compile_mode.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts_compile_samples(&self) -> bool {
+        self.count_compile_samples
     }
 
     /// A test binary, remembered apart from the crate that compiled it.
@@ -303,6 +349,8 @@ impl Demand {
             threads,
             learns_cpu: true,
             profile: None,
+            compile_mode: None,
+            count_compile_samples: true,
             per_test: None,
         }
     }
@@ -315,6 +363,8 @@ impl Demand {
             threads: Some(1),
             learns_cpu: true,
             profile: None,
+            compile_mode: None,
+            count_compile_samples: true,
             per_test: Some(TestIdentity {
                 binary: binary.to_owned(),
                 test: test.to_owned(),
@@ -347,6 +397,10 @@ impl Drop for Permit {
 #[derive(Debug, Serialize, Deserialize)]
 struct Lease {
     version: u8,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    mode_key: Option<String>,
     weight: u64,
     priority: String,
     #[serde(default)]
@@ -359,6 +413,10 @@ struct Lease {
 
 #[derive(Serialize, Deserialize)]
 struct Waiting {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    mode_key: Option<String>,
     ticket: u64,
     weight: u64,
     priority: String,
@@ -680,6 +738,10 @@ struct MemoryLedger {
     /// Recent link measurements by code-generation profile, newest last.
     #[serde(default)]
     profile_link_peaks: BTreeMap<String, Vec<u64>>,
+    /// Successful non-link samples, capped at the trust threshold. Peaks stay
+    /// in `crates` so old shims preserve them, but dropping counts is safe.
+    #[serde(default)]
+    compile_samples: BTreeMap<String, u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -998,7 +1060,7 @@ impl Pool {
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
-            match self.try_admit_queued(weight, gate, &mut queued) {
+            match self.try_admit_named(weight, gate, &mut queued, Some(demand)) {
                 Ok(Some(permit)) => return Some(permit),
                 Ok(None) => {}
                 Err(error) => {
@@ -1173,7 +1235,13 @@ impl Pool {
         // the two by far. Keyed by name alone it would retire the floor for
         // the link beside it, which is over-admission with a plausible number
         // attached to it.
-        let predicted = recorded.or(link_bytes);
+        let predicted = demand
+            .compile_mode
+            .as_deref()
+            .map_or(recorded, |key| {
+                compile_prediction(&ledger, &demand.name, key).0
+            })
+            .or(link_bytes);
         // Memory and threads are separate costs of the same process; it takes
         // whichever share of the pool is larger.
         let weight = predicted
@@ -1194,6 +1262,16 @@ impl Pool {
         weight: u64,
         predicted: Option<u64>,
         queued: &mut Option<QueueEntry>,
+    ) -> Result<Option<Permit>> {
+        self.try_admit_named(weight, predicted, queued, None)
+    }
+
+    fn try_admit_named(
+        &self,
+        weight: u64,
+        predicted: Option<u64>,
+        queued: &mut Option<QueueEntry>,
+        demand: Option<&Demand>,
     ) -> Result<Option<Permit>> {
         let leases = self.dir.join(LEASES_DIR);
         std::fs::create_dir_all(&leases)
@@ -1295,6 +1373,12 @@ impl Pool {
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
                 let record = Waiting {
+                    name: demand.map(|d| d.name.clone()),
+                    mode_key: demand.map(|d| {
+                        d.compile_mode
+                            .clone()
+                            .unwrap_or_else(|| ledger_key(&d.name, d.links))
+                    }),
                     ticket,
                     weight,
                     priority: self.priority.as_str().into(),
@@ -1310,7 +1394,7 @@ impl Pool {
             }
             return Ok(None);
         }
-        let permit = self.grant(&leases, weight)?;
+        let permit = self.grant(&leases, weight, demand)?;
         *queued = None;
         if let Some((path, state)) = pressure_state.as_ref().zip(pressure.as_mut()) {
             state.last_admission_ms = Some(now);
@@ -1330,8 +1414,14 @@ impl Pool {
     /// and this compilation would then run unscheduled. So the name carries a
     /// token drawn once per process, and the file is created exclusively so
     /// that a collision is an error to retry rather than an overwrite.
-    fn grant(&self, leases: &Path, weight: u64) -> Result<Permit> {
+    fn grant(&self, leases: &Path, weight: u64, demand: Option<&Demand>) -> Result<Permit> {
         let lease = serde_json::to_vec(&Lease {
+            name: demand.map(|d| d.name.clone()),
+            mode_key: demand.map(|d| {
+                d.compile_mode
+                    .clone()
+                    .unwrap_or_else(|| ledger_key(&d.name, d.links))
+            }),
             version: LEASE_VERSION,
             weight,
             priority: self.priority.as_str().into(),
@@ -1413,6 +1503,14 @@ impl Pool {
         let Some(measured) = child_peak_rss_bytes() else {
             return;
         };
+        if demand.compile_mode.is_some() {
+            if let Err(error) =
+                self.record_compile(demand, measured, oom_killed(status), status.success())
+            {
+                debug!("compiler memory was not recorded: {error:#}");
+            }
+            return;
+        }
         let Some(peak) = ledger_peak(
             measured,
             oom_killed(status),
@@ -1430,6 +1528,80 @@ impl Pool {
         ) {
             debug!("compiler memory was not recorded: {error:#}");
         }
+    }
+
+    fn record_compile(
+        &self,
+        demand: &Demand,
+        measured: u64,
+        oom: bool,
+        succeeded: bool,
+    ) -> Result<()> {
+        let Some(key) = demand.compile_mode.as_ref() else {
+            return Ok(());
+        };
+        if self.bytes_per_permit == 0 {
+            return Ok(());
+        }
+        let succeeded = succeeded && demand.count_compile_samples;
+        let peak = ledger_peak(measured, oom, false, succeeded, self.bytes_per_permit);
+        // Ordinary light crates need no ledger lock. A concurrent first heavy
+        // sample may be missed here; that only delays trusting the light mode.
+        if peak.is_none()
+            && !read_ledger(&self.ledger_path())
+                .crates
+                .contains_key(&demand.name)
+        {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let mut lock = fslock::LockFile::open(&self.dir.join(LEDGER_LOCK))?;
+        lock.lock()?;
+        let mut ledger = read_ledger(&self.ledger_path());
+        let mode_peak = peak.unwrap_or(measured);
+        let bare_known = ledger.crates.get(&demand.name).copied();
+        let mode_known = ledger.crates.get(key).copied();
+        let count = ledger.compile_samples.get(key).copied().unwrap_or(0);
+        if bare_known.is_some_and(|bare| peak.is_none_or(|peak| peak <= bare))
+            && mode_known.is_some_and(|known| known >= mode_peak)
+            && (!succeeded || oom || count >= 3)
+        {
+            return Ok(());
+        }
+        if let Some(peak) = peak {
+            // A mode may survive without its bare entry (e.g. an old writer's
+            // eviction). Recreating the fallback must cover every retained
+            // mode, rather than cap a known mode below its measured maximum.
+            let retained = if bare_known.is_none() {
+                let prefix = format!("{} [compile ", demand.name);
+                ledger
+                    .crates
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .map(|(_, peak)| *peak)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let bare = ledger.crates.entry(demand.name.clone()).or_default();
+            *bare = (*bare).max(peak).max(retained);
+        }
+        if !ledger.crates.contains_key(&demand.name) {
+            return Ok(());
+        }
+        // Even a light successful mode must learn when its crate is heavy.
+        let mode = ledger.crates.entry(key.clone()).or_default();
+        *mode = (*mode).max(mode_peak);
+        if succeeded && !oom {
+            let count = ledger.compile_samples.entry(key.clone()).or_default();
+            *count = count.saturating_add(1).min(3);
+        }
+        ledger.version = LEDGER_VERSION;
+        trim_compile_ledger(&mut ledger);
+        let mut contents = serde_json::to_vec(&ledger)?;
+        contents.push(b'\n');
+        crate::util::write_advisory(&self.ledger_path(), &contents)
     }
 
     fn ledger_path(&self) -> PathBuf {
@@ -1562,15 +1734,7 @@ impl Pool {
         if !known {
             ledger.crates.insert(name.to_string(), peak);
         }
-        while ledger.crates.len() > MAX_LEDGER_ENTRIES {
-            let smallest = ledger
-                .crates
-                .iter()
-                .min_by_key(|(_, peak)| **peak)
-                .map(|(name, _)| name.clone())
-                .expect("an overfull ledger has entries");
-            ledger.crates.remove(&smallest);
-        }
+        trim_compile_ledger(&mut ledger);
         let mut contents = serde_json::to_vec(&ledger)?;
         contents.push(b'\n');
         // A heuristic every link refreshes: a lost write costs one sample.
@@ -1671,6 +1835,326 @@ fn link_profile(arguments: &[std::ffi::OsString]) -> String {
         units.unwrap_or("-"),
         debug.unwrap_or("0"),
     )
+}
+
+/// Compile suffixes start with `[compile `, unlike link/profile and test
+/// suffixes. Rust crate identifiers contain neither spaces nor brackets.
+fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
+    let mut emits = std::collections::BTreeSet::new();
+    let mut saw_emit = false;
+    let mut crate_types = std::collections::BTreeSet::new();
+    let mut targets = Vec::new();
+    let mut test = false;
+    let mut incremental = false;
+    let mut threads = None;
+    let mut args = arguments.iter().filter_map(|a| a.to_str());
+    while let Some(arg) = args.next() {
+        if arg == "--test" {
+            test = true;
+            continue;
+        }
+        let emit = if arg == "--emit" {
+            args.next()
+        } else {
+            arg.strip_prefix("--emit=")
+        };
+        if let Some(value) = emit {
+            saw_emit = true;
+            emits.extend(value.split(',').filter_map(|kind| {
+                let kind = kind.split('=').next()?;
+                (kind != "dep-info").then_some(kind)
+            }));
+            continue;
+        }
+        let types = if arg == "--crate-type" {
+            args.next()
+        } else {
+            arg.strip_prefix("--crate-type=")
+        };
+        if let Some(value) = types {
+            crate_types.extend(value.split(','));
+            continue;
+        }
+        let triple = if arg == "--target" {
+            args.next()
+        } else {
+            arg.strip_prefix("--target=")
+        };
+        if let Some(value) = triple {
+            targets.push(value);
+            continue;
+        }
+        let setting = match arg {
+            "-C" | "--codegen" => args.next(),
+            _ => arg
+                .strip_prefix("-C")
+                .or_else(|| arg.strip_prefix("--codegen=")),
+        };
+        if let Some(value) = setting.and_then(|s| s.strip_prefix("incremental=")) {
+            incremental = !value.is_empty();
+        }
+        let unstable = match arg {
+            "-Z" => args.next(),
+            _ => arg.strip_prefix("-Z"),
+        };
+        if let Some(value) = unstable.and_then(|s| s.strip_prefix("threads=")) {
+            threads = Some(value);
+        }
+    }
+    if !saw_emit {
+        emits.insert("link");
+    }
+    format!(
+        "emit={} crate-type={}{}{} {} incremental-{}{}",
+        emits.into_iter().collect::<Vec<_>>().join(","),
+        crate_types.into_iter().collect::<Vec<_>>().join(","),
+        // Every target, in order, when there is more than one: such a compile
+        // must not share a key with any single-target compile, whichever
+        // target a rustc would honor.
+        match targets.as_slice() {
+            [] => String::new(),
+            [target] => format!(" target={target:?}"),
+            targets => format!(" targets={targets:?}"),
+        },
+        if test { " test" } else { "" },
+        link_profile(arguments),
+        if incremental { "on" } else { "off" },
+        threads.map(|n| format!(" threads={n}")).unwrap_or_default()
+    )
+}
+
+fn compile_prediction(ledger: &MemoryLedger, name: &str, key: &str) -> (Option<u64>, bool) {
+    let bare = ledger.crates.get(name).copied();
+    if ledger.compile_samples.get(key).copied().unwrap_or(0) >= 3
+        && let Some(peak) = ledger.crates.get(key).copied()
+    {
+        let padded = peak.saturating_add(peak.div_ceil(2));
+        return (Some(bare.map_or(padded, |bare| padded.min(bare))), true);
+    }
+    (bare, false)
+}
+
+fn trim_compile_ledger(ledger: &mut MemoryLedger) {
+    while ledger.crates.len() > MAX_LEDGER_ENTRIES {
+        let smallest = ledger
+            .crates
+            .iter()
+            .min_by_key(|(_, peak)| **peak)
+            .map(|(name, _)| name.clone())
+            .expect("overfull ledger");
+        ledger.crates.remove(&smallest);
+        ledger.compile_samples.remove(&smallest);
+        // If a crate-wide fallback is evicted, remove its modes too. Counts
+        // must never survive an evicted peak and authorize a new low reading.
+        let prefix = format!("{smallest} [compile ");
+        ledger.crates.retain(|key, _| !key.starts_with(&prefix));
+    }
+    ledger
+        .compile_samples
+        .retain(|key, _| ledger.crates.contains_key(key));
+}
+
+/// A read-only snapshot: files may include abandoned records until the next
+/// admission reclaims them. Inspecting statistics must never acquire a lease.
+#[derive(Debug, Serialize)]
+pub(crate) struct SchedulerReport {
+    enabled: bool,
+    capacity: u64,
+    bytes_per_permit: u64,
+    entries: Vec<SchedulerEntry>,
+    activity: Vec<SchedulerActivity>,
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerEntry {
+    key: String,
+    recorded_peak_bytes: u64,
+    successful_samples: u8,
+    charge_bytes: Option<u64>,
+    charge_permits: Option<u64>,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerActivity {
+    kind: &'static str,
+    name: String,
+    mode_key: String,
+    build_id: String,
+    pressure_domain: String,
+    charged_permits: u64,
+    charged_bytes: u64,
+    age_secs: Option<u64>,
+}
+
+/// Charges under the global scheduler settings. A workspace `.mbx.toml` can
+/// change them for its own builds, and only `mbx cargo` resolves which
+/// workspace that is; lease and waiter records keep what was really charged.
+pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
+    let capacity = config.scheduler.permits();
+    scheduler_snapshot(
+        &config.cache_dir.join(SCHEDULER_DIR),
+        capacity,
+        bytes_per_permit(config.scheduler.memory_bytes, capacity),
+        config.scheduler.enabled,
+    )
+}
+
+fn scheduler_snapshot(
+    dir: &Path,
+    capacity: u64,
+    bytes_per_permit: u64,
+    enabled: bool,
+) -> SchedulerReport {
+    let ledger = read_ledger(&dir.join(LEDGER_FILE));
+    let entries = ledger
+        .crates
+        .iter()
+        .map(|(key, &peak)| {
+            let mode = key.split_once(" [compile ");
+            let predictable = mode.is_some() || !key.contains(" [");
+            let (charge, trusted) = if predictable {
+                compile_prediction(&ledger, mode.map_or(key.as_str(), |(name, _)| name), key)
+            } else {
+                (None, false)
+            };
+            let charge_bytes = (bytes_per_permit > 0).then_some(charge).flatten();
+            SchedulerEntry {
+                key: key.clone(),
+                recorded_peak_bytes: peak,
+                successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
+                charge_bytes,
+                charge_permits: charge_bytes
+                    .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
+                source: if !predictable {
+                    "see admission"
+                } else if bytes_per_permit == 0 {
+                    "CPU-only"
+                } else if trusted {
+                    "mode"
+                } else {
+                    "crate-wide fallback"
+                },
+            }
+        })
+        .collect();
+    let mut activity = Vec::new();
+    for (subdir, kind) in [(LEASES_DIR, "lease"), (WAITERS_DIR, "waiter")] {
+        let Ok(files) = std::fs::read_dir(dir.join(subdir)) else {
+            continue;
+        };
+        let mut paths: Vec<_> = files
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let age_secs = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            let record = if kind == "lease" {
+                serde_json::from_slice::<Lease>(&bytes).ok().map(|l| {
+                    (
+                        l.name,
+                        l.mode_key,
+                        l.build_id,
+                        l.domain,
+                        l.weight,
+                        l.bytes_per_permit,
+                    )
+                })
+            } else {
+                serde_json::from_slice::<Waiting>(&bytes).ok().map(|w| {
+                    (
+                        w.name,
+                        w.mode_key,
+                        w.build.map(|(id, _)| id),
+                        Some(w.domain),
+                        w.weight,
+                        w.bytes_per_permit,
+                    )
+                })
+            };
+            if let Some((name, mode, build, domain, weight, unit)) = record {
+                let unknown = || "unknown".to_owned();
+                activity.push(SchedulerActivity {
+                    kind,
+                    name: name.unwrap_or_else(unknown),
+                    mode_key: mode.unwrap_or_else(unknown),
+                    build_id: build.unwrap_or_else(unknown),
+                    pressure_domain: domain.unwrap_or_else(unknown),
+                    charged_permits: weight,
+                    charged_bytes: weight.saturating_mul(unit),
+                    age_secs,
+                });
+            }
+        }
+    }
+    SchedulerReport {
+        enabled,
+        capacity,
+        bytes_per_permit,
+        entries,
+        activity,
+    }
+}
+
+impl SchedulerReport {
+    pub(crate) fn text(&self) -> String {
+        let mut lines = vec![format!(
+            "Scheduler: {} ({} permits, {}/permit, from the global settings)",
+            if self.enabled { "enabled" } else { "disabled" },
+            self.capacity,
+            crate::stats::size(self.bytes_per_permit)
+        )];
+        for e in &self.entries {
+            let charge = e.charge_bytes.zip(e.charge_permits).map_or_else(
+                || "see admission".to_owned(),
+                |(bytes, permits)| format!("{} / {permits} permits", crate::stats::size(bytes)),
+            );
+            let source = if e.source == "see admission" {
+                String::new()
+            } else {
+                format!(" ({})", e.source)
+            };
+            lines.push(format!(
+                "  {}: peak={}, samples={}, charge={}{}",
+                e.key,
+                crate::stats::size(e.recorded_peak_bytes),
+                e.successful_samples,
+                charge,
+                source
+            ));
+        }
+        if self.entries.is_empty() {
+            lines.push("  No recorded memory peaks.".into());
+        }
+        lines.push(
+            "  Activity snapshot (may include abandoned records; no lease locks taken):".into(),
+        );
+        for a in &self.activity {
+            lines.push(format!(
+                "  {} {}: mode={}, build={}, domain={}, charge={} / {} permits, age={}",
+                a.kind,
+                a.name,
+                a.mode_key,
+                a.build_id,
+                a.pressure_domain,
+                crate::stats::size(a.charged_bytes),
+                a.charged_permits,
+                a.age_secs
+                    .map_or_else(|| "unknown".into(), |s| format!("{s}s"))
+            ));
+        }
+        if self.activity.is_empty() {
+            lines.push("  No lease or waiter records.".into());
+        }
+        lines.join("\n")
+    }
 }
 
 fn read_ledger(path: &Path) -> MemoryLedger {
@@ -1984,6 +2468,8 @@ fn scan_leases(leases: &Path) -> Result<Vec<Lease>> {
             .and_then(|bytes| serde_json::from_slice::<Lease>(&bytes).ok())
             .map_or_else(
                 || Lease {
+                    name: None,
+                    mode_key: None,
                     version: LEASE_VERSION,
                     weight: 1,
                     priority: SchedulerPriority::Normal.as_str().into(),

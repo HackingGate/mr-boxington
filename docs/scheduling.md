@@ -60,6 +60,34 @@ measures compiler memory on Unix only, so on Windows, compilations keep these
 starting weights. Set `scheduler.memory = "none"` to use CPU permits without
 memory weighting.
 
+For non-link compiles of a crate already measured above one memory permit,
+mbx learns separate peaks for each set of emitted outputs, crate types, and
+explicit target. Repeated emit and crate-type flags are combined, sorted, and
+deduplicated; output paths and dep-info do not distinguish modes. With no
+emit flag, rustc emits a link output. The mode also includes test compilation,
+optimization, LTO, codegen units, debug info, incremental compilation
+(including flags added by mbx), and explicit compiler thread settings. Clippy
+compiles learn their own estimates, apart from `cargo check`. A compile with
+more than one `--target` matches no single-target mode.
+After three successful samples of a mode (the stored count is capped at
+three), its estimate is the mode's highest peak plus 50% headroom, capped at
+the crate-wide highest peak. Until then, mbx uses the crate-wide peak. Peaks
+never decrease; failed compiles and compiles run through another wrapper,
+such as a `RUSTC_WRAPPER` cache, do not count as successful samples, and OOM
+kills raise both peaks. An older shim
+that drops sample counts makes modes return to the crate-wide fallback.
+
+`mbx stats --scheduler` shows scheduler peaks, successful sample counts, and
+compile charges in readable sizes and permits, with their mode or crate-wide
+fallback source. Link and test-run entries show recorded peaks and defer
+charges to admission. Add `--json` for raw byte counts. Without `--scheduler`,
+the stats output omits this section. Its charges use the global scheduler
+settings; a workspace `.mbx.toml` can change them for that workspace's builds.
+The read-only activity snapshot shows each lease and waiter with its name, mode
+key, build ID, pressure domain, age, and the charge it was really admitted or
+queued with. Older records show unknown names; abandoned records can remain
+visible until an admission reclaims them.
+
 When a compilation cannot fit, it queues before newer requests. New requests
 stop filling the capacity it needs, so a large compilation can run even while
 other builds keep submitting small ones. Cancelling a waiter or killing its
