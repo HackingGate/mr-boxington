@@ -44,6 +44,8 @@ pub(crate) use diagnostics::{
 #[cfg(unix)]
 pub(crate) use server::create_fifo;
 pub(crate) use server::listener_unavailable;
+#[cfg(all(test, unix))]
+pub(crate) use server::socket_path_limit;
 use server::spawn_server;
 pub(crate) use shims::CC_CRATE_ENV;
 #[cfg(all(test, windows))]
@@ -65,6 +67,36 @@ use stats::{
     ci_summary, short_summary, should_display_short_stats, should_display_stats,
     stale_manifest_note,
 };
+
+/// Create the private directory that holds a session's socket.
+///
+/// A Unix-domain socket path must fit in `sun_path` (108 bytes on Linux), and
+/// `$TMPDIR` can be arbitrarily long, so the directory goes under
+/// `$XDG_RUNTIME_DIR` when it is set: the XDG Base Directory
+/// specification's per-user, mode 0700 place for sockets. Otherwise it is the
+/// system temporary directory. Every session user calls this one function.
+pub(crate) fn create_session_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    let base = session_dir_base(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        std::env::temp_dir(),
+    );
+    tempfile::Builder::new().prefix(prefix).tempdir_in(base)
+}
+
+/// The directory `create_session_dir` creates under. A relative or missing
+/// runtime directory is ignored, since the specification requires an absolute
+/// path that exists.
+fn session_dir_base(runtime_dir: Option<&OsStr>, fallback: PathBuf) -> PathBuf {
+    if cfg!(unix)
+        && let Some(runtime_dir) = runtime_dir
+    {
+        let runtime_dir = Path::new(runtime_dir);
+        if runtime_dir.is_absolute() && runtime_dir.is_dir() {
+            return runtime_dir.to_path_buf();
+        }
+    }
+    fallback
+}
 
 pub const RUSTC_SHIM_STEM: &str = "mbx-rustc";
 pub const RUSTDOC_SHIM_STEM: &str = "mbx-rustdoc";

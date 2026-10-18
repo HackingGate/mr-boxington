@@ -2068,3 +2068,44 @@ fn routine_bypasses_are_debug_but_failed_cache_paths_are_warnings() {
         AgentRequest::RecordWarning { .. }
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn session_directory_prefers_an_existing_absolute_runtime_directory() {
+    let runtime = tempfile::tempdir().unwrap();
+    let fallback = PathBuf::from("/fallback");
+    assert_eq!(
+        session_dir_base(Some(runtime.path().as_os_str()), fallback.clone()),
+        runtime.path()
+    );
+    for unusable in [
+        Some(OsStr::new("")),
+        Some(OsStr::new("relative/run")),
+        Some(OsStr::new("/nonexistent/run/user")),
+        None,
+    ] {
+        assert_eq!(session_dir_base(unusable, fallback.clone()), fallback);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_session_under_a_socket_path_over_the_limit_names_the_path_and_limit() {
+    let cache = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let mut config = test_config(cache.path());
+    config.shims_dir = private.path().join("shims");
+    let limit = crate::session::socket_path_limit();
+    let base = tempfile::tempdir().unwrap();
+    let session_dir = base.path().join("d".repeat(limit));
+    std::fs::create_dir(&session_dir).unwrap();
+    let message = match CacheSession::start(&session_dir, &config).await {
+        Ok(_) => panic!("a session started with an unbindable socket path"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        message.contains(&format!("{limit}-byte limit")),
+        "{message}"
+    );
+    assert!(message.contains(session_dir.to_str().unwrap()), "{message}");
+}
