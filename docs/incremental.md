@@ -32,13 +32,43 @@ Dependents of a crate using private incremental state also keep private state,
 because their inputs contain an artifact other checkouts cannot share. They can
 publish again after the edited crate compiles once more without a source change.
 
+### Start new checkouts warm
+
+rustc ignores incremental state recorded under another working directory, so a
+new checkout's first edit to each crate compiles that crate from scratch. Give
+rustc the same working directory in every checkout and that state carries over:
+
+```toml
+# .cargo/config.toml
+[build]
+rustflags = ["-Zremap-cwd-prefix=/src"]
+```
+
+The flag needs a nightly toolchain, or `RUSTC_BOOTSTRAP=1` on a stable one, and
+seeding needs rustc 1.98 or later: earlier releases check incremental state
+against the real working directory and ignore another checkout's, so mbx copies
+nothing for them.
+With it, when a crate first needs private state in a checkout, mbx copies the
+state of the most recently used checkout that has some for the same crate and
+flags, hard-linking its files. rustc validates the copied state against the
+sources it compiles, as after any edit, so the first edit in a new worktree
+compiles incrementally.
+
+rustc also records the paths of the crates it links and the outputs it writes,
+and each checkout has its own target directory. So that those match too, mbx
+names every path under the working directory relative to it when it compiles a
+crate with private state under this flag. Debug info and panic messages then
+name paths under `/src` instead of the checkout.
+
 ### Where state lives
 
 mbx keeps the state and its records under `incremental/` in the cache
 directory, separately for each checkout. `cargo clean` does not remove this
 state. `mbx clean` and `mbx cache remove` remove it for the selected workspace.
-[Collection](/managed-targets#collection) removes it for deleted, expired, or
+[Collection](/managed-targets#collection) removes it for expired or
 least-recently-used checkouts, but never removes state a running build is using.
+A deleted checkout's state stays until then too, so that a new checkout can
+start from it.
 
 ### Bound the storage
 

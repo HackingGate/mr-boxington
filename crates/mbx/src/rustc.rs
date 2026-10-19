@@ -5,7 +5,7 @@ use crate::materialize::{
     record_action_hit_with_diagnostic, record_verification, replay_bytes, resolve_executable,
     stage_verified_cached_output, staging_directory, validate_file_mode,
 };
-use crate::{session, util::workspace_root};
+use crate::{incremental, session, util::workspace_root};
 use eyre::{Context, Result, bail};
 use mbx_cache_core::{
     ActionDiagnostic, ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory,
@@ -66,10 +66,16 @@ struct LearnedPlan {
 }
 
 impl LearnedPlan {
-    /// Find somewhere to keep the state, for a unit that earned it.
-    fn resolved(mut self, invocation: &CacheDigest, crate_name: &str) -> Self {
+    /// Find somewhere to keep the state, for a unit that earned it. State
+    /// that does not depend on the checkout's location may start from another
+    /// checkout's; see [`incremental::seed`].
+    fn resolved(mut self, compilation: &Compilation<'_>, unit: &CacheDigest) -> Self {
         if self.hot {
-            self.directory = incremental_directory(invocation, crate_name);
+            self.directory = incremental_directory(
+                unit,
+                compilation.invocation.crate_name(),
+                shares_incremental_state(compilation.rustc, compilation.invocation),
+            );
         }
         self
     }
@@ -520,7 +526,12 @@ pub(crate) fn compile(
     let compilation_started = SystemTime::now();
     let compiler_timer = Instant::now();
     let mut command = compiler_command(rustc, wrapper_argument);
-    command.args(&arguments).current_dir(&working_dir);
+    if incremental_flag.is_some() && shares_incremental_state(rustc, &invocation) {
+        command.args(paths_relative_to(&arguments, &working_dir));
+    } else {
+        command.args(&arguments);
+    }
+    command.current_dir(&working_dir);
     let private_outputs = private_inputs || learned.engaged();
     if let Some(flag) = incremental_flag {
         // Keep private incremental state out of cacheability parsing, while
@@ -1255,6 +1266,109 @@ fn compiler_command(rustc: &OsStr, wrapper_argument: Option<&OsStr>) -> Command 
     command
 }
 
+/// The arguments with every path under the working directory named relative
+/// to it.
+///
+/// rustc checks incremental state against its options and records where it
+/// found upstream crates and wrote its outputs; state recorded with other
+/// paths is ignored or mostly recompiled. Each checkout has its own target
+/// directory, so the absolute paths in a compilation -- search paths, extern
+/// crates, the output directory, mbx's own `OUT_DIR` remapping -- differ
+/// between checkouts even where nothing else does. Relative to the working
+/// directory, which `-Zremap-cwd-prefix` keeps out of the state, they are the
+/// same in each, and they still name this checkout's files.
+///
+/// Only the command that runs changes: the key resolves relative paths against
+/// the working directory too. See [`relative_in`] for what counts as a path.
+fn paths_relative_to(arguments: &[OsString], working_dir: &Path) -> Vec<OsString> {
+    let Some(root) = working_dir.to_str() else {
+        return arguments.to_vec();
+    };
+    let mut rewritten = Vec::with_capacity(arguments.len());
+    let mut previous = None;
+    for argument in arguments {
+        let Some(text) = argument.to_str() else {
+            previous = None;
+            rewritten.push(argument.clone());
+            continue;
+        };
+        let value = if previous == Some("--remap-path-prefix") {
+            remap_relative_in(text, root)
+        } else if let Some(remap) = text.strip_prefix("--remap-path-prefix=") {
+            format!("--remap-path-prefix={}", remap_relative_in(remap, root))
+        } else if text.starts_with("-Zremap-cwd-prefix")
+            || (previous == Some("-Z") && text.starts_with("remap-cwd-prefix"))
+        {
+            // The virtual directory written in the working directory's place.
+            text.to_owned()
+        } else if is_link_option(text, previous) {
+            // Only the linker reads these, and rustc leaves them out of what
+            // its state is checked against. They can also embed a path in the
+            // output, such as an rpath, which has to stay absolute.
+            text.to_owned()
+        } else {
+            relative_in(text, root)
+        };
+        previous = Some(text);
+        rewritten.push(OsString::from(value));
+    }
+    rewritten
+}
+
+/// `-C link-arg`, `-C link-args`, `-C linker`, and `-Z pre-link-arg(s)`,
+/// attached or after a separate `-C`/`-Z`.
+fn is_link_option(text: &str, previous: Option<&str>) -> bool {
+    const CODEGEN: [&str; 2] = ["link-arg", "linker"];
+    const UNSTABLE: [&str; 1] = ["pre-link-arg"];
+    let starts = |value: &str, names: &[&str]| names.iter().any(|name| value.starts_with(name));
+    text.strip_prefix("-C")
+        .is_some_and(|value| starts(value, &CODEGEN))
+        || text
+            .strip_prefix("-Z")
+            .is_some_and(|value| starts(value, &UNSTABLE))
+        || (previous == Some("-C") && starts(text, &CODEGEN))
+        || (previous == Some("-Z") && starts(text, &UNSTABLE))
+}
+
+/// A `--remap-path-prefix` value with its source made relative. rustc splits
+/// it at the last `=`, and the destination is the literal text recorded in the
+/// source's place, not a path to open, so it stays as written.
+fn remap_relative_in(remap: &str, root: &str) -> String {
+    match remap.rsplit_once('=') {
+        Some((from, to)) => format!("{}={to}", relative_in(from, root)),
+        None => remap.to_owned(),
+    }
+}
+
+/// `text` with the working directory written as `.` wherever a path starts:
+/// at the beginning, or after `=` or `,`. `./` rather than nothing keeps a
+/// shortened executable, such as a linker, from being looked up on `PATH`.
+fn relative_in(text: &str, root: &str) -> String {
+    let mut rewritten = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut at_start = true;
+    while !rest.is_empty() {
+        if at_start
+            && let Some(after) = rest.strip_prefix(root)
+            // Windows accepts either separator, and Cargo can mix them.
+            && after
+                .chars()
+                .next()
+                .is_none_or(|next| std::path::is_separator(next) || matches!(next, '=' | ','))
+        {
+            rewritten.push('.');
+            rest = after;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        rewritten.push(next);
+        rest = &rest[next.len_utf8()..];
+        at_start = matches!(next, '=' | ',');
+    }
+    rewritten
+}
+
 /// The executable Cargo will run as a build script, when this compilation
 /// produced one; see [`session::is_cargo_build_script`].
 fn cargo_build_script_executable<'a>(
@@ -1318,16 +1432,59 @@ fn learned_plan(
     }
 }
 
+/// Whether one checkout's incremental state for this compilation is as good as
+/// another's, so that it can be seeded from one and its paths made relative.
+///
+/// That takes `-Zremap-cwd-prefix`, and a rustc that checks its state against
+/// the working directory as the flag presents it, which it first does in 1.98.
+/// Earlier releases compare the real directory and ignore state recorded in
+/// any other checkout, so copying it would only cost time and disk.
+fn shares_incremental_state(rustc: &OsStr, invocation: &RustcInvocation) -> bool {
+    invocation.remaps_working_directory()
+        && compiler_identity(rustc)
+            .is_ok_and(|identity| release_at_least(&identity.rustc_version, (1, 98)))
+}
+
+/// Whether a [`CompilerIdentity::rustc_version`] names `minimum` or later, by
+/// its `rustc <major>.<minor>.<patch>` line.
+fn release_at_least(rustc_version: &str, minimum: (u32, u32)) -> bool {
+    let Some(release) = rustc_version
+        .split(['\n', ';'])
+        .find_map(|line| line.trim().strip_prefix("rustc "))
+    else {
+        return false;
+    };
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let mut next = || parts.next().and_then(|part| part.parse::<u32>().ok());
+    matches!((next(), next()), (Some(major), Some(minor)) if (major, minor) >= minimum)
+}
+
 /// Where one unit keeps its incremental state.
 ///
 /// A session gives it a persistent per-checkout root outside Cargo's target
 /// directory. A standalone shim falls back to its target directory when one is
 /// available, and compiles normally when it has nowhere to put state.
-pub(crate) fn incremental_directory(invocation: &CacheDigest, crate_name: &str) -> Option<PathBuf> {
+///
+/// A `seedable` unit starting without state here takes another checkout's
+/// first, so the checkout's first edit to it compiles incrementally too.
+pub(crate) fn incremental_directory(
+    invocation: &CacheDigest,
+    crate_name: &str,
+    seedable: bool,
+) -> Option<PathBuf> {
     let root = incremental_root()?;
     let key = invocation.key();
     let shard = key.get(..16)?;
     let directory = root.join(shard);
+    if seedable
+        && !directory.exists()
+        && let Err(error) = incremental::seed(&root, shard)
+    {
+        // Compiles from scratch, as it would have without a donor.
+        session::report_shim_warning(&format!(
+            "incremental state for {crate_name} was not seeded: {error:#}"
+        ));
+    }
     match prepare_incremental_directory(&directory, session::learned_incremental_max_size()) {
         Ok(discarded) => {
             if let Some(bytes) = discarded {
@@ -1399,7 +1556,7 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
         identity.extend_from_slice(argument.as_encoded_bytes());
         identity.push(0);
     }
-    let directory = incremental_directory(&CacheDigest::blake3(&identity), &crate_name)?;
+    let directory = incremental_directory(&CacheDigest::blake3(&identity), &crate_name, false)?;
     Some(private_incremental_flag(&directory))
 }
 
@@ -1484,7 +1641,7 @@ fn plan_learned_reuse(
             record: Some((state_path, sources)),
             ..plan
         }
-        .resolved(&unit, compilation.invocation.crate_name()))
+        .resolved(compilation, &unit))
     })();
     match planned {
         Ok(plan) => plan,
@@ -1614,7 +1771,7 @@ fn eager_incremental_plan(compilation: &Compilation<'_>) -> LearnedPlan {
                 hot: true,
                 ..LearnedPlan::default()
             }
-            .resolved(&unit, compilation.invocation.crate_name()),
+            .resolved(compilation, &unit),
         )
     })();
     planned.unwrap_or_else(|error| {
@@ -1680,7 +1837,7 @@ fn reuse_hot_workspace_plan(
             directory: None,
             record: Some((state_path, sources)),
         }
-        .resolved(&unit, compilation.invocation.crate_name()))
+        .resolved(compilation, &unit))
     })();
     match planned {
         Ok(plan) => plan,

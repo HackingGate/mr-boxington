@@ -1421,6 +1421,206 @@ fn eager_incremental_keeps_non_workspace_dependencies_shared() {
     );
 }
 
+/// One checkout's incremental state directory.
+fn incremental_checkout(cache: &Path, workspace: &Path) -> PathBuf {
+    let workspace = workspace.canonicalize().unwrap();
+    incremental_checkouts(cache)
+        .into_iter()
+        .find(|(root, _)| root.canonicalize().is_ok_and(|root| root == workspace))
+        .map(|(_, state)| state)
+        .unwrap_or_else(|| panic!("{} keeps no incremental state", workspace.display()))
+}
+
+/// The checkouts' incremental state directories, keyed by workspace root.
+fn incremental_checkouts(cache: &Path) -> Vec<(PathBuf, PathBuf)> {
+    std::fs::read_dir(cache.join("incremental"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|checkout| {
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(checkout.path().join("checkout.json")).ok()?)
+                    .ok()?;
+            let root = PathBuf::from(record["workspace_root"].as_str()?);
+            Some((root, checkout.path()))
+        })
+        .collect()
+}
+
+/// Whether the `rustc` these tests build with accepts incremental state
+/// recorded in another checkout under `-Zremap-cwd-prefix` (1.98 and later).
+fn rustc_relocates_incremental_state() -> bool {
+    let output = Command::new("rustc").arg("-vV").output().unwrap();
+    let verbose = String::from_utf8(output.stdout).unwrap();
+    let release = verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .expect("rustc -vV names its release");
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let mut next = || parts.next().unwrap().parse::<u32>().unwrap();
+    (next(), next()) >= (1, 98)
+}
+
+#[test]
+fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory() {
+    const MARKER: &str = "seeded-from-first";
+    let store = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let unremapped = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let remapped = [
+        ("RUSTC_BOOTSTRAP", "1"),
+        ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
+    ];
+    // A module the edit never touches compiles to its own codegen units, which
+    // rustc reuses rather than recompiles when it accepts the state.
+    let stable = (0..64)
+        .map(|index| {
+            format!("pub fn f{index}(x: u64) -> u64 {{ x.rotate_left({index}) ^ {index} }}\n")
+        })
+        .collect::<String>();
+    let lib = |value: u32| {
+        format!(
+            "#![doc = include_str!(\"../../README.md\")]\npub mod stable;\npub fn value() -> u32 {{ {value} }}\n"
+        )
+    };
+    let edit = |project: &Path| std::fs::write(project.join("base/src/lib.rs"), lib(21)).unwrap();
+    for project in [first.path(), second.path(), unremapped.path()] {
+        write_dependent_project(project);
+        std::fs::write(project.join("base/src/stable.rs"), &stable).unwrap();
+        std::fs::write(project.join("base/src/lib.rs"), lib(0)).unwrap();
+    }
+
+    build_with(
+        first.path(),
+        store.path(),
+        &reports.path().join("first.json"),
+        &remapped,
+    );
+    edit(first.path());
+    let edited = build_with(
+        first.path(),
+        store.path(),
+        &reports.path().join("first-edit.json"),
+        &remapped,
+    )
+    .0;
+    assert!(compiled_incrementally(&edited) >= 1, "{edited}");
+    // rustc leaves files it does not know about in the state directory alone,
+    // and the seed copies all of it: the marker is how the second checkout's
+    // state can tell where it came from.
+    let first_state = incremental_checkout(store.path(), first.path());
+    let units = find_files(&first_state, |path| {
+        file_name_is(path, |name| name == "query-cache.bin")
+    });
+    assert!(!units.is_empty(), "the edit should leave rustc state");
+    for unit in &units {
+        // <unit>/<crate>-<hash>/<session>/query-cache.bin
+        let unit = unit.ancestors().nth(3).unwrap();
+        std::fs::write(unit.join(MARKER), b"").unwrap();
+    }
+
+    build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("second.json"),
+        &remapped,
+    );
+    edit(second.path());
+    let seeded = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("second-edit.json"),
+        &remapped,
+    )
+    .0;
+    assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
+    let second_state = incremental_checkout(store.path(), second.path());
+    let seeded_from_first = !find_files(&second_state, |path| {
+        file_name_is(path, |name| name == MARKER)
+    })
+    .is_empty();
+    // Before 1.98, rustc checks incremental state against the real working
+    // directory and ignores another checkout's whatever the flag says, so mbx
+    // copies nothing.
+    if !rustc_relocates_incremental_state() {
+        assert!(
+            !seeded_from_first,
+            "state rustc would ignore should not be copied"
+        );
+        return;
+    }
+    assert!(
+        seeded_from_first,
+        "the second checkout's first edit should start from the first checkout's state"
+    );
+    // Copied is not reused: rustc rejects state recorded with different
+    // options and compiles everything afresh. It links each codegen unit it
+    // reuses from the previous session into the new one, so only reuse leaves
+    // the newest session holding the donor's own object files.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let objects = |directory: &Path| {
+            find_files(directory, |path| {
+                path.extension().is_some_and(|extension| extension == "o")
+            })
+        };
+        let donor = objects(&first_state)
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().ino())
+            .collect::<std::collections::HashSet<_>>();
+        let newest = find_files(&second_state, |path| {
+            file_name_is(path, |name| name == "dep-graph.bin")
+        })
+        .into_iter()
+        .filter(|graph| {
+            graph.ancestors().nth(2).is_some_and(|krate| {
+                krate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("base-"))
+            })
+        })
+        .max_by_key(|graph| std::fs::metadata(graph).unwrap().modified().unwrap())
+        .expect("the second checkout keeps state for base")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+        let reused = objects(&newest)
+            .iter()
+            .filter(|path| donor.contains(&std::fs::metadata(path).unwrap().ino()))
+            .count();
+        assert!(
+            reused > 0,
+            "rustc should reuse the seeded codegen units in {}",
+            newest.display()
+        );
+    }
+
+    // Without the flag rustc would ignore another checkout's state, so none
+    // is copied.
+    build_with(
+        unremapped.path(),
+        store.path(),
+        &reports.path().join("unremapped.json"),
+        &[],
+    );
+    edit(unremapped.path());
+    build_with(
+        unremapped.path(),
+        store.path(),
+        &reports.path().join("unremapped-edit.json"),
+        &[],
+    );
+    let unremapped_state = incremental_checkout(store.path(), unremapped.path());
+    assert!(
+        find_files(&unremapped_state, |path| file_name_is(path, |name| name
+            == MARKER))
+        .is_empty()
+    );
+}
+
 #[test]
 fn learned_private_dependents_reuse_state_after_the_target_is_removed() {
     let store = tempfile::tempdir().unwrap();
@@ -5425,10 +5625,14 @@ mod target_views {
         let cas = store.path().join("actions/cas/v1");
         std::fs::remove_dir_all(&cas).unwrap();
         std::fs::write(&cas, b"not a directory").unwrap();
+        // A deleted checkout's incremental state is kept for new checkouts to
+        // start from until it expires; expiry is measured in whole seconds.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
 
         let output = mbx_command()
             .args(["gc", "--max-size", "20GiB"])
             .env("MBX_CACHE_DIR", store.path())
+            .env("MBX_GC_INCREMENTAL_MAX_AGE", "0s")
             .output()
             .expect("mbx should run");
 
