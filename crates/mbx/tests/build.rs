@@ -1554,6 +1554,10 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     let second = tempfile::tempdir().unwrap();
     let unremapped = tempfile::tempdir().unwrap();
     let reports = tempfile::tempdir().unwrap();
+    // Apply the GC branch's seeding backstop checks to both remap modes.
+    let mut environment = remapped.to_vec();
+    environment.extend([("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"), ("MBX_GC_AUTO", "0")]);
+    let remapped = environment.as_slice();
     // A module the edit never touches compiles to its own codegen units, which
     // rustc reuses rather than recompiles when it accepts the state.
     let stable = (0..64)
@@ -1599,6 +1603,11 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     for unit in &units {
         // <unit>/<crate>-<hash>/<session>/query-cache.bin
         let unit = unit.ancestors().nth(3).unwrap();
+        assert!(
+            unit.with_extension("json").is_file(),
+            "state and history must share a unit identity: {}",
+            unit.display()
+        );
         std::fs::write(unit.join(MARKER), b"").unwrap();
     }
 
@@ -1618,10 +1627,44 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     .0;
     assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
     let second_state = incremental_checkout(store.path(), second.path());
+    let seeded_units = find_files(&second_state, |path| {
+        file_name_is(path, |name| name == MARKER)
+    })
+    .into_iter()
+    .map(|path| path.parent().unwrap().to_path_buf())
+    .collect::<Vec<_>>();
+    for unit in &seeded_units {
+        assert!(
+            unit.with_extension("json").is_file(),
+            "seeded state must have its own churn record"
+        );
+    }
     let seeded_from_first = !find_files(&second_state, |path| {
         file_name_is(path, |name| name == MARKER)
     })
     .is_empty();
+    let saved_sessions = find_files(&second_state, |path| {
+        file_name_is(path, |name| name == "query-cache.bin")
+    });
+    assert!(!saved_sessions.is_empty());
+    std::fs::write(second.path().join("base/src/lib.rs"), lib(22)).unwrap();
+    let oversized = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("oversized-edit.json"),
+        remapped,
+    )
+    .0;
+    assert_eq!(
+        compiled_incrementally(&oversized),
+        0,
+        "existing oversized state takes the shared path: {oversized}"
+    );
+    assert!(
+        saved_sessions.iter().all(|session| session.exists()),
+        "the backstop leaves existing sessions for collection"
+    );
+
     // Before 1.98, rustc checks incremental state against the real working
     // directory and ignores another checkout's whatever the flag says, so mbx
     // copies nothing.
@@ -1698,6 +1741,108 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         find_files(&unremapped_state, |path| file_name_is(path, |name| name
             == MARKER))
         .is_empty()
+    );
+
+    // Age this fixture's rustc sessions past the collector's start grace.
+    let mut pending = vec![store.path().join("incremental")];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+            filetime::set_file_mtime(entry.path(), filetime::FileTime::from_unix_time(1, 0))
+                .unwrap();
+        }
+    }
+    let collected = mbx_command()
+        .args(["gc", "--max-size", "20GiB"])
+        .env("MBX_CACHE_DIR", store.path())
+        .env("MBX_GC_INCREMENTAL_MAX_SIZE", "0B")
+        .env("MBX_GC_MIN_FREE_SIZE", "0B")
+        .output()
+        .unwrap();
+    assert!(collected.status.success(), "{collected:?}");
+    for unit in seeded_units {
+        assert!(!unit.exists(), "gc must collect the seeded unit");
+        assert!(
+            !unit.with_extension("json").exists(),
+            "gc must collect its marked churn record too"
+        );
+    }
+    for state in [first_state, second_state, unremapped_state] {
+        assert!(
+            find_files(&state.join("blake3"), |path| path
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .is_empty(),
+            "no churn record should be orphaned after collecting this fixture's units"
+        );
+    }
+}
+
+#[test]
+fn learned_incremental_marked_history_survives_edits_and_seed_policy_changes() {
+    if !rustc_relocates_incremental_state() {
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let records = || {
+        find_files(
+            &incremental_checkout(store.path(), project.path()).join("blake3"),
+            |path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            },
+        )
+    };
+    let build_revision = |revision, seed| {
+        edit_project(project.path(), revision);
+        build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &[("MBX_SEED_INCREMENTAL", seed)],
+        )
+        .0
+    };
+    assert_eq!(compiled_incrementally(&build_revision(0, "1")), 0);
+    let marked = records();
+    assert_eq!(marked.len(), 1);
+    for revision in [1, 2] {
+        assert_eq!(compiled_incrementally(&build_revision(revision, "1")), 1);
+        assert_eq!(records(), marked, "edits keep the marked history");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marked[0]).unwrap()).unwrap();
+        assert_eq!(record["streak"], 1);
+    }
+    assert_eq!(
+        compiled_incrementally(&build_revision(3, "0")),
+        0,
+        "turning seeding off starts separate history"
+    );
+    let both = records();
+    assert_eq!(both.len(), 2);
+    let unmarked = both.iter().find(|path| !marked.contains(path)).unwrap();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(unmarked).unwrap()).unwrap();
+    assert_eq!(record["streak"], 0);
+    assert_eq!(compiled_incrementally(&build_revision(4, "0")), 1);
+    assert_eq!(
+        compiled_incrementally(&build_revision(5, "1")),
+        1,
+        "the marked streak survives while seeding is off"
+    );
+    let mut after = records();
+    let mut before = both;
+    after.sort();
+    before.sort();
+    assert_eq!(
+        after, before,
+        "neither policy creates another identity on later edits"
     );
 }
 
@@ -2375,6 +2520,58 @@ fn editing_one_crate_takes_its_dependents_private_too() {
     assert!(
         settled["stored_bytes"].as_u64().unwrap_or(0) > 0,
         "a settled cone should publish again: {settled}"
+    );
+}
+
+#[test]
+fn a_staticlib_above_the_incremental_backstop_leaves_existing_sessions_alone() {
+    fn sessions(root: &Path) -> Vec<PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut sessions = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    if entry.file_name().to_string_lossy().starts_with("s-") {
+                        sessions.push(entry.path());
+                    } else {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+        sessions.sort();
+        sessions
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let manifest = project.path().join("Cargo.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[lib]\ncrate-type = [\"staticlib\", \"rlib\"]\n");
+    std::fs::write(&manifest, text).unwrap();
+    generate_lockfile(project.path());
+    let environment = [("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"), ("MBX_GC_AUTO", "0")];
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+        &environment,
+    );
+    let before = sessions(&store.path().join("incremental"));
+    assert_eq!(before.len(), 1);
+    edit_project(project.path(), 1);
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("edit.json"),
+        &environment,
+    );
+    assert_eq!(
+        sessions(&store.path().join("incremental")),
+        before,
+        "an oversized staticlib must compile without creating another incremental session"
     );
 }
 
@@ -5798,7 +5995,7 @@ mod target_views {
             "successful target collection should still be reported"
         );
         assert!(
-            stdout.contains("removed 1 learned incremental directories"),
+            stdout.contains("learned incremental units and 1 checkout directories"),
             "successful incremental collection should still be reported: {stdout}"
         );
         assert!(

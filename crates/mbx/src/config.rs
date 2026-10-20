@@ -219,16 +219,6 @@ pub(crate) struct RawConfig {
     /// `-Zremap-cwd-prefix` still enables seeding when this setting is off.
     #[usage(env = "MBX_SEED_INCREMENTAL", default = true)]
     seed_incremental: bool,
-    /// How much learned incremental state one crate may keep, or `"none"`.
-    ///
-    /// State past this is discarded before the crate compiles again.
-    /// Defaults to 8 GiB even when `gc.max_total_size` is set.
-    #[usage(
-        key = "learned_incremental_max_size",
-        env = "MBX_LEARNED_INCREMENTAL_MAX_SIZE",
-        default_note = "8 GiB"
-    )]
-    learned_incremental_max_size: Option<String>,
     /// Cap on the per-compilation history one build records, or `"none"`.
     ///
     /// Past the cap, the totals the build reports stay complete but its
@@ -585,8 +575,8 @@ struct RawTarget {
     root: Option<PathBuf>,
     /// Size budget for managed targets, or `"none"`.
     ///
-    /// Over budget, mbx collects managed targets least recently used first and
-    /// keeps the most recently used one.
+    /// Over budget, mbx collects inactive managed targets least recently used
+    /// first. Use `target.keep` to protect specific checkouts.
     #[usage(
         env = "MBX_TARGET_MAX_SIZE",
         default_note = "10% of the target disk, from 10 GiB to 100 GiB; shared budget when `gc.max_total_size` is set"
@@ -642,9 +632,11 @@ struct RawGc {
     /// Shared budget for learned incremental state and generated source trees,
     /// or `"none"`.
     ///
-    /// Over budget, mbx collects the incremental state of inactive checkouts
-    /// least recently used first and keeps the most recently used checkout's.
-    /// Generated source trees get whatever budget incremental state leaves.
+    /// Over budget, mbx collects inactive incremental units least recently
+    /// used first, using rustc session directory modification times.
+    /// Generated source trees are collected first, capped at their current
+    /// size or 10% of this shared budget, whichever is smaller. Incremental
+    /// units get the remaining budget.
     /// With `gc.max_total_size`, defaults to 10% of that total, at least
     /// 10 GiB but never above the total.
     #[usage(
@@ -652,7 +644,7 @@ struct RawGc {
         default_note = "5% of the cache disk, from 10 GiB to 100 GiB; with `gc.max_total_size`, 10% of the total, at least 10 GiB but never above the total"
     )]
     incremental_max_size: Option<String>,
-    /// Collect learned incremental state unused this long, or `"none"`.
+    /// Collect learned incremental units unused this long, or `"none"`.
     #[usage(env = "MBX_GC_INCREMENTAL_MAX_AGE", default = "30d", ty = "duration")]
     incremental_max_age: String,
     /// Free space to keep on the disks that hold the cache directory and
@@ -660,8 +652,8 @@ struct RawGc {
     ///
     /// Below it, sweeps run more often and collect private state, generated
     /// source trees, managed targets, and shared store objects past their
-    /// budgets to free the shortfall. Active and most recently used state
-    /// stays, so the disk can remain short.
+    /// budgets to free the shortfall. Active state and explicitly kept targets
+    /// stay, so the disk can remain short.
     #[usage(
         env = "MBX_GC_MIN_FREE_SIZE",
         default_note = "10% of each disk, from 5 GiB to 50 GiB"
@@ -1020,15 +1012,6 @@ impl MinFree {
     }
 }
 
-/// The declared default of `learned_incremental_max_size`.
-///
-/// A crate's incremental state is roughly proportional to the crate, not to
-/// how often it is edited, because rustc discards superseded sessions itself.
-/// A large workspace binary with line tables keeps a few GiB, so the budget is
-/// generous enough that ordinary crates never hit it; discarding state on
-/// every edit would silently turn the edit loop back into full recompilation.
-pub(crate) const DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
-
 /// The declared default of `events_max_size`.
 ///
 /// The cap exists so the TUI can read a session's tail without reading a
@@ -1055,8 +1038,8 @@ pub(crate) struct CliSettings {
     /// Whether a churning crate may compile with its own incremental state.
     pub learned_incremental: bool,
     pub seed_incremental: bool,
-    /// How much of that state one crate may keep, in bytes; `None` is no limit.
-    pub learned_incremental_max_size: Option<u64>,
+    /// A retired global setting was present; only the CLI reports this notice.
+    pub removed_incremental_cap: bool,
     /// Whether natively linked programs may be cached.
     pub cache_links: bool,
     /// How many bytes of per-compilation rows one build may record; `None` is
@@ -1076,7 +1059,7 @@ impl Default for CliSettings {
             plain_output: false,
             learned_incremental: true,
             seed_incremental: true,
-            learned_incremental_max_size: Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE),
+            removed_incremental_cap: false,
             cache_links: true,
             events_max_size: Some(DEFAULT_EVENTS_MAX_SIZE),
         }
@@ -1197,10 +1180,21 @@ impl Default for HttpSettings {
 impl Config {
     /// Load configuration for this machine.
     pub fn load() -> Result<Self> {
-        Self::load_for_cli().map(|(config, _)| config)
+        Self::load_from_environment().map(|(config, _)| config)
     }
 
     pub(crate) fn load_for_cli() -> Result<(Self, CliSettings)> {
+        let (config, settings) = Self::load_from_environment()?;
+        // Compiler shims use load(), so only the outer CLI reports this notice.
+        if settings.removed_incremental_cap {
+            log::warn!(
+                "learned_incremental_max_size was removed and is ignored; use gc.incremental_max_size to bound aggregate state"
+            );
+        }
+        Ok((config, settings))
+    }
+
+    fn load_from_environment() -> Result<(Self, CliSettings)> {
         let env = EnvLayer::from_process();
         let file = config_file_path().map(|path| FileLayer::at(path, FileScope::Global));
         Self::from_layers_for_cli(&env, file.as_ref())
@@ -1230,9 +1224,20 @@ impl Config {
             layers = layers.then(file);
         }
         let resolved = usage_config::resolve(RawConfig::SETTINGS_REGISTRY, layers)?;
-        if !resolved.warnings.is_empty() {
-            let problems = resolved
-                .warnings
+        let mut removed_incremental_cap = false;
+        let warnings = resolved
+            .warnings
+            .iter()
+            .filter(|warning| {
+                let removed = is_retired_setting(warning);
+                if removed {
+                    removed_incremental_cap = true;
+                }
+                !removed
+            })
+            .collect::<Vec<_>>();
+        if !warnings.is_empty() {
+            let problems = warnings
                 .iter()
                 .map(|warning| match &warning.origin {
                     Some(origin) => format!("{} ({})", warning.message, origin.describe()),
@@ -1243,7 +1248,9 @@ impl Config {
             bail!("invalid configuration:\n{problems}");
         }
         let raw = RawConfig::read(&resolved)?;
-        Self::from_raw_measuring(raw, measure_disk, measure_memory)
+        let (config, mut settings) = Self::from_raw_measuring(raw, measure_disk, measure_memory)?;
+        settings.removed_incremental_cap = removed_incremental_cap;
+        Ok((config, settings))
     }
 
     /// Resolve settings, measuring the machine with the given probes.
@@ -1484,13 +1491,7 @@ impl Config {
                 plain_output: raw.display == "plain",
                 learned_incremental: raw._learned_incremental,
                 seed_incremental: raw.seed_incremental,
-                learned_incremental_max_size: raw
-                    .learned_incremental_max_size
-                    .as_deref()
-                    .map(parse_optional_byte_size)
-                    .transpose()
-                    .wrap_err(Invalid("learned_incremental_max_size"))?
-                    .unwrap_or(Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE)),
+                removed_incremental_cap: false,
                 cache_links: raw.cache_links,
                 events_max_size: parse_optional_byte_size(&raw.events_max_size)
                     .wrap_err(Invalid("events_max_size"))?,
@@ -1522,6 +1523,12 @@ impl Config {
             .wrap_err_with(|| format!("failed to parse {}", path.display()))?;
 
         for (key, value) in document.iter() {
+            if key == "learned_incremental_max_size" {
+                log::warn!(
+                    "learned_incremental_max_size was removed and is ignored; use gc.incremental_max_size to bound aggregate state"
+                );
+                continue;
+            }
             if key == "linker" {
                 if environment_contains("MBX_LINKER") {
                     continue;
@@ -1825,6 +1832,17 @@ impl std::fmt::Display for Invalid {
     }
 }
 
+fn is_retired_setting(warning: &usage_config::Warning) -> bool {
+    warning.kind == usage_config::WarningKind::UnknownSetting
+        && warning.origin.as_ref().is_some_and(|origin| {
+            origin.kind == usage_config::SourceKind::FILE
+                && origin
+                    .identifier
+                    .rsplit_once('#')
+                    .is_some_and(|(_, key)| key == "learned_incremental_max_size")
+        })
+}
+
 /// `error` followed by how to fix each setting it names.
 ///
 /// Resolved a second time rather than threaded through, because only a
@@ -1841,7 +1859,12 @@ fn with_repair_hints(
     let Ok(resolved) = usage_config::resolve(RawConfig::SETTINGS_REGISTRY, layers) else {
         return error;
     };
-    let hints = if resolved.warnings.is_empty() {
+    let warnings = resolved
+        .warnings
+        .iter()
+        .filter(|warning| !is_retired_setting(warning))
+        .collect::<Vec<_>>();
+    let hints = if warnings.is_empty() {
         error
             .downcast_ref::<Invalid>()
             .and_then(|invalid| {
@@ -1852,8 +1875,7 @@ fn with_repair_hints(
             .into_iter()
             .collect::<Vec<_>>()
     } else {
-        resolved
-            .warnings
+        warnings
             .iter()
             .filter_map(|warning| {
                 let origin = warning.origin.as_ref()?;
@@ -2481,10 +2503,6 @@ mod tests {
             assert_eq!(settings.retention.max_total_bytes, Some(total));
             assert_eq!(settings.retention.target_max_bytes, None);
             assert_eq!(settings.retention.incremental_max_bytes, Some(incremental));
-            assert_eq!(
-                settings.learned_incremental_max_size,
-                Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE)
-            );
             assert_eq!(settings.retention.min_free, Some(MinFree::ShareOfDisk));
             assert_eq!(
                 settings.retention.target_max_age,
@@ -2510,7 +2528,6 @@ incremental_max_size = "5GiB"
         assert_eq!(config.gc.max_bytes, 4 * GIB);
         assert_eq!(settings.retention.target_max_bytes, Some(3 * GIB));
         assert_eq!(settings.retention.incremental_max_bytes, Some(5 * GIB));
-        assert_eq!(settings.learned_incremental_max_size, Some(2 * GIB));
 
         let (_, settings) = configured_for_cli(
             Some(
@@ -2528,7 +2545,6 @@ incremental_max_size = "none"
         .unwrap();
         assert_eq!(settings.retention.target_max_bytes, None);
         assert_eq!(settings.retention.incremental_max_bytes, None);
-        assert_eq!(settings.learned_incremental_max_size, None);
     }
 
     #[test]
@@ -2548,10 +2564,6 @@ incremental_max_size = "none"
         assert_eq!(
             settings.retention.incremental_max_bytes,
             expected.retention.incremental_max_bytes
-        );
-        assert_eq!(
-            settings.learned_incremental_max_size,
-            expected.learned_incremental_max_size
         );
     }
 
@@ -2743,30 +2755,31 @@ incremental_max_size = "none"
         assert!(!settings.learned_incremental);
     }
 
-    /// The budget has to hold a real crate's state: rustc keeps one session's
-    /// worth per crate, and a large binary's session is a few GiB.
     #[test]
-    fn learned_incremental_state_budget_is_generous_and_can_be_lifted() {
+    fn removed_incremental_cap_is_ignored_without_hiding_other_errors() {
         let (_, settings) = configured_for_cli(None, &[]).unwrap();
-        assert_eq!(
-            settings.learned_incremental_max_size,
-            Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE)
-        );
-
-        let (_, settings) =
-            configured_for_cli(None, &[("MBX_LEARNED_INCREMENTAL_MAX_SIZE", "2GiB")]).unwrap();
-        assert_eq!(
-            settings.learned_incremental_max_size,
-            Some(2 * 1024 * 1024 * 1024)
-        );
-
-        let (_, settings) =
-            configured_for_cli(None, &[("MBX_LEARNED_INCREMENTAL_MAX_SIZE", "none")]).unwrap();
-        assert_eq!(settings.learned_incremental_max_size, None);
-
-        let error =
-            configured_for_cli(None, &[("MBX_LEARNED_INCREMENTAL_MAX_SIZE", "lots")]).unwrap_err();
-        assert!(error.to_string().contains("learned_incremental_max_size"));
+        assert!(!settings.removed_incremental_cap);
+        for value in ["2GiB", "none", "invalid"] {
+            let contents = format!("learned_incremental_max_size = {value:?}");
+            let (_, settings) = configured_for_cli(Some(&contents), &[]).unwrap();
+            assert!(settings.removed_incremental_cap);
+        }
+        let error = configured_for_cli(
+            Some("learned_incremental_max_size = \"2GiB\"\nunknown_key = true"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown_key"));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".mbx.toml"),
+            "learned_incremental_max_size = \"8GiB\"",
+        )
+        .unwrap();
+        let (mut config, _) = configured_for_cli(None, &[]).unwrap();
+        config
+            .apply_workspace_policy_with(directory.path(), |_| false)
+            .unwrap();
     }
 
     /// The default keeps the TUI's read cheap; diagnosing a miss on a large
@@ -3096,6 +3109,30 @@ default = "rust-lld"
             format!("{:#}", with_repair_hints(error, &env, None)),
             "invalid scheduler.cpus: must be a positive count\n\
              MBX_SCHEDULER_CPUS sets it; change or unset that variable"
+        );
+    }
+
+    #[test]
+    fn retired_setting_does_not_hide_an_invalid_values_repair_hint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "learned_incremental_max_size = \"2GiB\"\n[gc]\ninterval = \"soon\"\n",
+        )
+        .unwrap();
+        let env = EnvLayer::new(Vec::<(String, String)>::new());
+        let file = FileLayer::at(&path, FileScope::Global);
+        let error = Config::from_layers_for_cli(&env, Some(&file)).unwrap_err();
+        let message = format!("{:#}", with_repair_hints(error, &env, Some(&file)));
+        assert!(message.contains("invalid gc.interval"), "{message}");
+        assert!(
+            message.contains("`mbx settings set gc.interval <value>`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("learned_incremental_max_size"),
+            "{message}"
         );
     }
 

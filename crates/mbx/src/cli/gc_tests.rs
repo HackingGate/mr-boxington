@@ -347,8 +347,8 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
     let report = prune_targets(&config, &always_short(), config.gc.max_bytes);
 
     assert!(!views[0].exists(), "the older checkout's target went");
-    assert!(views[1].exists(), "the most recently used one is kept");
-    assert_eq!(report.freed_bytes, 64);
+    assert!(!views[1].exists(), "the newest inactive target also goes");
+    assert_eq!(report.freed_bytes, 128);
     assert!(
         report.removals[0].contains("under the"),
         "the report says why: {:?}",
@@ -514,22 +514,22 @@ fn a_combined_budget_shares_unoccupied_store_capacity() {
             !views[0].exists(),
             "the older target makes room for the occupied store"
         );
-        assert!(views[1].exists(), "the newest target remains protected");
+        assert!(views[1].exists(), "the newest target still fits the budget");
         let tight = RetentionSettings {
             max_total_bytes: Some(32),
             ..retention
         };
         let sweep = sweep_store(&config, &tight);
         assert!(
-            views[1].exists(),
-            "even an impossible budget preserves the newest target"
+            !views[1].exists(),
+            "a tighter budget also evicts the newest inactive target"
         );
         assert!(
-            sweep
+            !sweep
                 .lines
                 .iter()
                 .any(|line| line.contains("over gc.max_total_size")),
-            "the next build receives the budget warning: {:?}",
+            "without protected targets the budget can be met: {:?}",
             sweep.lines
         );
     }
@@ -596,5 +596,77 @@ fn unavailable_component_sizes_do_not_leave_room_in_a_combined_budget() {
                 assert!(broken.exists(), "the unmeasurable component is left alone");
             }
         }
+    }
+}
+
+#[test]
+fn incremental_report_merges_unit_counts_and_serializes_additively() {
+    let initial = crate::incremental::PruneOutcome {
+        removed_units: 2,
+        removed_directories: 1,
+        removed_bytes: 20,
+        remaining_units: 5,
+        ..Default::default()
+    };
+    let later = crate::incremental::PruneOutcome {
+        removed_units: 3,
+        removed_bytes: 30,
+        remaining_units: 2,
+        skipped_active_units: 1,
+        ..Default::default()
+    };
+    let report = serde_json::to_value(merged_incremental_report(&initial, Some(&later))).unwrap();
+    assert_eq!(report["removed_units"], 5);
+    assert_eq!(report["remaining_units"], 2);
+    assert_eq!(report["skipped_active_units"], 1);
+    assert_eq!(report["removed_directories"], 1);
+    assert_eq!(report["removed_bytes"], 50);
+}
+
+#[test]
+fn generated_trees_get_a_bounded_first_share_despite_busy_incremental_state() {
+    for automatic in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = super::cargo_tests::managed_target_config(directory.path());
+        let incremental = config.cache_dir.join("incremental/untracked");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("busy"), [0; 200]).unwrap();
+        let root = config.cache_dir.join(crate::out_dir::ROOT);
+        for name in ["1".repeat(64), "2".repeat(64)] {
+            let tree = root.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("generated.rs"), [0; 4]).unwrap();
+        }
+        let mut retention = RetentionSettings {
+            incremental_max_bytes: Some(100),
+            incremental_max_age: None,
+            target_max_bytes: None,
+            target_max_age: None,
+            min_free: None,
+            ..always_short()
+        };
+        let collect = |retention: &RetentionSettings| {
+            if automatic {
+                prune_targets(&config, retention, config.gc.max_bytes);
+            } else {
+                gc::run(&config, config.gc.max_bytes, false, false, retention).unwrap();
+            }
+        };
+        collect(&retention);
+        let generated = crate::out_dir::stats(&root).unwrap();
+        assert_eq!(generated.remaining_directories, 2);
+        assert_eq!(
+            generated.remaining_bytes, 8,
+            "under the 10-byte first share"
+        );
+        assert!(incremental.join("busy").exists());
+        retention.incremental_max_bytes = Some(40);
+        collect(&retention);
+        let generated = crate::out_dir::stats(&root).unwrap();
+        assert_eq!(generated.remaining_directories, 1);
+        assert_eq!(
+            generated.remaining_bytes, 4,
+            "capped at one tenth of the share"
+        );
     }
 }

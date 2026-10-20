@@ -75,7 +75,7 @@ accept values such as `30s`, `15m`, `1h`, and `30d`.
 | Pin a linker per profile or target | [Managed linkers](/linkers) |
 | Tune the shared compiler pool | [Parallel builds](/scheduling) |
 | Keep private incremental state from the first compilation | `mbx settings set eager_incremental true`; [incremental builds](/incremental#eager-incremental-reuse) |
-| Bound learned incremental state per crate | `mbx settings set learned_incremental_max_size 12GiB`; [incremental builds](/incremental#bound-the-storage) |
+| Bound private incremental state across checkouts | `mbx settings set gc.incremental_max_size 30GiB`; [incremental builds](/incremental#storage-and-collection) |
 | Compare restored outputs with fresh compilations | `MBX_VERIFY=1`; [troubleshooting](/troubleshooting#verify-mode) |
 
 <span id="managed-linkers"></span>
@@ -176,15 +176,18 @@ incremental state, and [generated source trees](/limits#out-dir-sharing).
 These components share the budget without the usual disk-scaled size caps;
 learned incremental state and generated source trees default to a cap of 10%
 of the total, at least 10 GiB but never above the total.
-The per-crate learned incremental limit still defaults to 8 GiB.
+Incremental units are collected individually by age and least recent use;
+a build in the same checkout does not refresh unused units.
 Explicit component limits still apply; remove those settings if you want mbx
 to manage the allocation. Age limits and the automatic disk-free-space
 safeguard remain enabled.
 
 Collection reserves only the space the action store occupies, up to its limit,
 so an empty store does not force useful targets out. Learned incremental state
-and generated source trees use the remaining allowance up to their cap; managed
-targets use what remains after them. If protected state leaves less room, mbx
+and generated source trees use the remaining allowance up to their cap.
+Generated trees are collected first to the smaller of their current size or
+10% of that shared allowance; incremental units get what remains after them.
+Managed targets use what remains after both. If protected state leaves less room, mbx
 collects the action store to fit the remaining budget. This order favors shared cached
 results and incremental state over older target directories; allocation is not
 based on measured rebuild cost.
@@ -192,7 +195,7 @@ based on measured rebuild cost.
 The budget is a **logical-byte collection target**, not a physical disk quota.
 Shared blocks can make physical usage smaller, while metadata, session history,
 and temporary files add overhead outside the budget. Builds can exceed the
-budget between sweeps. Active builds, the most recently used state, explicitly
+budget between sweeps. Active builds, held incremental session locks, explicitly
 kept targets, and untracked state can also prevent collection from reaching it;
 mbx warns when the combined remainder exceeds the budget. If a component cannot
 be measured, mbx reports that the combined budget could not be verified and
@@ -226,7 +229,6 @@ cache_dir = "/var/cache/mbx"
 incremental = false
 eager_incremental = false  # opt-in state from the first compilation
 seed_incremental = true  # reuse private state across checkouts
-learned_incremental_max_size = "8GiB"  # or "none"
 share_out_dir = true
 share_workspace_root = false
 build_script_execution = true

@@ -45,6 +45,8 @@ pub(super) struct GcArgs {
     ///
     /// Defaults to `gc.max_size`. Managed targets, learned incremental state,
     /// and generated source trees are still collected to their own budgets.
+    /// Incremental units expire individually and are evicted least recently
+    /// used first; active builds and held rustc session locks protect them.
     /// With `gc.max_total_size` set, incremental state and generated source
     /// trees default to a cap of 10% of the total, at least 10 GiB but never
     /// above the total; managed targets use what remains after them and the
@@ -61,6 +63,8 @@ pub(super) struct GcArgs {
     /// disk again after each step. To free the cache disk, a real run can also
     /// evict more store objects than the action-store budget requires, and the
     /// preview never lists them.
+    /// A preview does not probe rustc's session locks, so it can list a unit
+    /// a compiler is still writing; a real run keeps such units.
     #[usage(long)]
     pub(super) dry_run: bool,
     /// Run the throttled sweep a build schedules, if one is due. Builds start
@@ -88,9 +92,16 @@ pub(super) fn run(
     // a combined budget must not prevent independent target collection when
     // the action store is damaged.
     let mut accounting_complete = true;
+    let generated = collect_generated_first(
+        config,
+        incremental_limit,
+        retention.target_max_age,
+        dry_run,
+        &mut accounting_complete,
+    );
     let incremental = match crate::incremental::collect(
         &config.cache_dir.join("incremental"),
-        incremental_limit,
+        incremental_limit.map(|share| share.saturating_sub(generated.remaining_bytes)),
         retention.incremental_max_age,
         dry_run,
     ) {
@@ -104,22 +115,13 @@ pub(super) fn run(
                 });
             crate::incremental::PruneOutcome {
                 remaining_directories: stats.directories,
+                remaining_units: stats.units,
                 remaining_bytes: stats.bytes,
                 untracked_directories: stats.untracked_directories,
                 ..crate::incremental::PruneOutcome::default()
             }
         }
     };
-    // Generated source trees share the learned incremental budget: both are
-    // per-checkout state that a compilation reads, and both come back on
-    // their own when evicted.
-    let generated = collect_generated(
-        config,
-        incremental_limit.map(|budget| budget.saturating_sub(incremental.remaining_bytes)),
-        retention.target_max_age,
-        dry_run,
-        &mut accounting_complete,
-    );
     // What survives counts against the combined budget the same as learned
     // incremental state: bytes on the disk the limit was set for.
     let reserved_bytes = incremental
@@ -295,12 +297,17 @@ pub(super) fn run(
     Ok(())
 }
 
-fn merged_incremental_report(
+pub(super) fn merged_incremental_report(
     initial: &crate::incremental::PruneOutcome,
     low_disk: Option<&crate::incremental::PruneOutcome>,
 ) -> GcIncrementalReport {
     let last = low_disk.unwrap_or(initial);
     GcIncrementalReport {
+        removed_units: initial
+            .removed_units
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_units)),
+        remaining_units: last.remaining_units,
+        skipped_active_units: last.skipped_active_units,
         removed_directories: initial
             .removed_directories
             .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_directories)),
@@ -353,6 +360,24 @@ fn merged_target_report(
         remaining_bytes: last.remaining_bytes,
         kept_active_directories: last.kept_active_views,
     }
+}
+
+/// Generated trees get the first, small claim on the shared incremental
+/// budget: at most their current bytes or one tenth of the share. Incremental
+/// units then use the remainder, so busy incremental state cannot starve them.
+fn collect_generated_first(
+    config: &Config,
+    share: Option<u64>,
+    max_age: Option<Duration>,
+    dry_run: bool,
+    accounting_complete: &mut bool,
+) -> crate::out_dir::PruneOutcome {
+    let budget = share.map(|share| {
+        let cap = share / 10;
+        crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))
+            .map_or(cap, |stats| stats.remaining_bytes.min(cap))
+    });
+    collect_generated(config, budget, max_age, dry_run, accounting_complete)
 }
 
 /// Collect the stable copies of build-script output nothing has used lately.
@@ -432,6 +457,8 @@ fn incremental_removal_lines(
     dry_run: bool,
 ) -> Vec<String> {
     if outcome.removed_directories == 0
+        && outcome.removed_units == 0
+        && outcome.skipped_active_units == 0
         && outcome.skipped_active_directories == 0
         && outcome.untracked_directories == 0
     {
@@ -439,15 +466,17 @@ fn incremental_removal_lines(
     }
     let verb = if dry_run { "would remove" } else { "removed" };
     let mut lines = vec![format!(
-        "{verb} {} learned incremental directories ({} logical); {} logical remain",
+        "{verb} {} learned incremental units and {} checkout directories ({} logical); {} units ({} logical) remain",
+        outcome.removed_units,
         outcome.removed_directories,
         ByteSize::b(outcome.removed_bytes).display().iec(),
+        outcome.remaining_units,
         ByteSize::b(outcome.remaining_bytes).display().iec(),
     )];
-    if outcome.skipped_active_directories > 0 {
+    if outcome.skipped_active_units > 0 || outcome.skipped_active_directories > 0 {
         lines.push(format!(
-            "kept {} learned incremental directories used by active builds",
-            outcome.skipped_active_directories
+            "kept {} learned incremental units used by active builds ({} active checkouts)",
+            outcome.skipped_active_units, outcome.skipped_active_directories
         ));
     }
     if outcome.untracked_directories > 0 {
@@ -927,13 +956,20 @@ pub(super) fn prune_targets(
     let mut low_disk = None;
     let store_reserve = occupied_store_budget(config, retention, store_reserve);
     let incremental_limit = incremental_limit(config, retention, store_reserve, &mut low_disk);
+    let mut accounting_complete = true;
+    let generated = collect_generated_first(
+        config,
+        incremental_limit,
+        retention.target_max_age,
+        false,
+        &mut accounting_complete,
+    );
     let incremental = crate::incremental::collect(
         &config.cache_dir.join("incremental"),
-        incremental_limit,
+        incremental_limit.map(|share| share.saturating_sub(generated.remaining_bytes)),
         retention.incremental_max_age,
         false,
     );
-    let mut accounting_complete = true;
     let (incremental_bytes, incremental_remaining) = match incremental {
         Ok(outcome) => (outcome.removed_bytes, outcome.remaining_bytes),
         Err(error) => {
@@ -949,13 +985,6 @@ pub(super) fn prune_targets(
             (0, remaining)
         }
     };
-    let generated = collect_generated(
-        config,
-        incremental_limit.map(|budget| budget.saturating_sub(incremental_remaining)),
-        retention.target_max_age,
-        false,
-        &mut accounting_complete,
-    );
     if generated.removed_directories > 0 {
         crate::session::note(&format!(
             "mbx[gc]: {}",
@@ -1256,6 +1285,9 @@ impl LowDiskCollection {
             .removed_directories
             .saturating_add(outcome.removed_directories);
         total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+        total.removed_units = total.removed_units.saturating_add(outcome.removed_units);
+        total.remaining_units = outcome.remaining_units;
+        total.skipped_active_units = outcome.skipped_active_units;
         total.remaining_directories = outcome.remaining_directories;
         total.remaining_bytes = outcome.remaining_bytes;
         total.skipped_active_directories = outcome.skipped_active_directories;
@@ -1450,7 +1482,7 @@ fn target_limit(
 
 /// Say when collection could not bring a disk back above its minimum.
 ///
-/// Active and most-recently-used state is protected, so a disk filled by
+/// Active state and explicitly kept targets are protected, so a disk filled by
 /// something else can stay short after collection has removed everything it
 /// is allowed to remove.
 fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
@@ -1462,7 +1494,7 @@ fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
         .flatten();
     for disk in cache.into_iter().chain(target) {
         log::warn!(
-            "the disk holding {} still has {} free after collection, under the {} minimum; collection removed everything it is allowed to remove (active or most-recently-used state is kept), so something else may be using the disk",
+            "the disk holding {} still has {} free after collection, under the {} minimum; collection removed everything it is allowed to remove (active state and explicitly kept targets are retained), so something else may be using the disk",
             disk.path.display(),
             ByteSize::b(disk.available).display().iec(),
             ByteSize::b(disk.min_free).display().iec(),
@@ -1499,7 +1531,7 @@ fn total_budget_warning(
     }
     let verb = if dry_run { "would remain" } else { "remain" };
     Some(format!(
-        "{} logical {verb} after collection, over gc.max_total_size ({}); active, most-recently-used, kept, or untracked state can prevent reaching this collection target",
+        "{} logical {verb} after collection, over gc.max_total_size ({}); active, kept, or untracked state can prevent reaching this collection target",
         ByteSize::b(remaining).display().iec(),
         ByteSize::b(budget).display().iec(),
     ))

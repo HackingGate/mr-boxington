@@ -156,7 +156,7 @@ Sweep after a build when collection is due.
 - **Default:** `30d`
 - **Set with:** `MBX_GC_INCREMENTAL_MAX_AGE`
 
-Collect learned incremental state unused this long, or `"none"`.
+Collect learned incremental units unused this long, or `"none"`.
 
 ### `gc.incremental_max_size`
 
@@ -167,7 +167,7 @@ Collect learned incremental state unused this long, or `"none"`.
 
 Shared budget for learned incremental state and generated source trees, or `"none"`.
 
-Over budget, mbx collects the incremental state of inactive checkouts least recently used first and keeps the most recently used checkout's. Generated source trees get whatever budget incremental state leaves. With `gc.max_total_size`, defaults to 10% of that total, at least 10 GiB but never above the total.
+Over budget, mbx collects inactive incremental units least recently used first, using rustc session directory modification times. Generated source trees are collected first, capped at their current size or 10% of this shared budget, whichever is smaller. Incremental units get the remaining budget. With `gc.max_total_size`, defaults to 10% of that total, at least 10 GiB but never above the total.
 
 ### `gc.interval`
 
@@ -209,7 +209,7 @@ A size such as `50GiB` counts logical bytes across the action store, managed tar
 
 Free space to keep on the disks that hold the cache directory and managed targets, or `"none"`.
 
-Below it, sweeps run more often and collect private state, generated source trees, managed targets, and shared store objects past their budgets to free the shortfall. Active and most recently used state stays, so the disk can remain short.
+Below it, sweeps run more often and collect private state, generated source trees, managed targets, and shared store objects past their budgets to free the shortfall. Active state and explicitly kept targets stay, so the disk can remain short.
 
 ### `http.download_timeout`
 
@@ -268,17 +268,6 @@ mbx stops forcing `CARGO_INCREMENTAL=0`, so Cargo's profiles decide: by default,
 Use private incremental state for crates whose sources keep changing.
 
 A workspace crate qualifies on its first source edit; any other crate after three consecutive misses with changed sources. A qualifying crate's outputs, and those of crates that link them, stay out of the shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while `incremental` or `eager_incremental` is in effect, and for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`.
-
-### `learned_incremental_max_size`
-
-- **Type:** `option<string>`
-- **Optional:** true
-- **Default:** 8 GiB
-- **Set with:** `MBX_LEARNED_INCREMENTAL_MAX_SIZE`
-
-How much learned incremental state one crate may keep, or `"none"`.
-
-State past this is discarded before the crate compiles again. Defaults to 8 GiB even when `gc.max_total_size` is set.
 
 ### `linker.default`
 
@@ -683,7 +672,7 @@ Collect managed targets, and build units inside them, unused this long, or `"non
 
 Size budget for managed targets, or `"none"`.
 
-Over budget, mbx collects managed targets least recently used first and keeps the most recently used one.
+Over budget, mbx collects inactive managed targets least recently used first. Use `target.keep` to protect specific checkouts.
 
 ### `target.root`
 
