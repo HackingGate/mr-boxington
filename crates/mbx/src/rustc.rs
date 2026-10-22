@@ -80,9 +80,15 @@ impl LearnedPlan {
             // Check this checkout's existing state before seeding. A rejected
             // unit takes the shared path without copying a donor's sessions.
             let directory = incremental_unit_path(unit);
-            if directory.as_ref().is_some_and(|directory| {
-                incremental_state_exceeds_backstop(directory, session::incremental_budget())
-            }) {
+            let rejected = directory
+                .as_deref()
+                .zip(session::incremental_budget())
+                .filter(|(directory, budget)| {
+                    incremental_state_exceeds_backstop(directory, Some(*budget))
+                });
+            if let Some((directory, budget)) = rejected {
+                // Hits stop refreshing its last use, so it is collected.
+                incremental::mark_rejected(directory, budget);
                 self.backstop_rejected = true;
                 self.hot = false;
                 self.directory = None;
@@ -92,6 +98,9 @@ impl LearnedPlan {
                     compilation.invocation.crate_name(),
                     mode_in_state_directory(mode, directory.as_deref()).shares_state(),
                 );
+                if let Some(directory) = &self.directory {
+                    incremental::clear_rejection(directory);
+                }
             }
         }
         self
@@ -1909,28 +1918,7 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
 /// Oversized learned state takes the shared compilation path this time.
 /// Leave it intact for collection instead of rewriting it on every edit.
 fn incremental_state_exceeds_backstop(directory: &Path, budget: Option<u64>) -> bool {
-    budget.is_some_and(|budget| directory_bytes(directory) > budget / 2)
-}
-
-fn directory_bytes(directory: &Path) -> u64 {
-    let mut total = 0;
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(listing) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in listing.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if metadata.is_file() {
-                total += metadata.len();
-            }
-        }
-    }
-    total
+    incremental::exceeds_backstop(directory, budget)
 }
 
 /// Work out the plan for a compilation that is about to miss.
@@ -2230,9 +2218,15 @@ fn source_is_in_workspace(compilation: &Compilation<'_>) -> bool {
 /// Establish the baseline after a first successful compilation, when dep-info
 /// finally supplies the complete set of sources. The next edit can then be
 /// recognized immediately.
+///
+/// Also a use of the unit's state, if this checkout has any: a hit restores
+/// it from the cache without running rustc, so no new session shows it.
 fn record_learned_baseline(compilation: &Compilation<'_>, discovered: &DiscoveredInputs) {
     let recorded = (|| {
         let (unit, _) = incremental_unit_identity(compilation)?;
+        if let Some(directory) = incremental_unit_path(&unit) {
+            incremental::stamp_use(&directory, session::incremental_budget());
+        }
         let Some(path) = churn_state_path(&unit) else {
             return Result::<()>::Ok(());
         };
