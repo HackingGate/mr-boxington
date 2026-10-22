@@ -158,6 +158,19 @@ fn only_a_binary_crate_type_is_a_possible_build_script() {
     assert!(!compiles_only_a_binary(&arguments(&["src/main.rs"])));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_build_script_invoked_without_its_exe_extension_finds_the_preserved_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory
+        .path()
+        .join(format!("build-script-build.exe{BUILD_SCRIPT_REAL_SUFFIX}"));
+    std::fs::write(&real, "real").unwrap();
+
+    let invoked = directory.path().join("build-script-build");
+    assert_eq!(find_build_script_real_path(&invoked), Some(real));
+}
+
 #[test]
 fn a_build_script_with_a_custom_path_is_recognized() {
     // `build = "builder/main.rs"` runs as `build-script-main`, compiled from
