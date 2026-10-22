@@ -9,6 +9,15 @@ use std::sync::OnceLock;
 const CARGO_SHIM_STEM: &str = "cargo";
 const CARGO_SHIM_MODE_ENV: &str = "MBX_CARGO_SHIM_MODE";
 const CARGO_SHIM_PATH_ENV: &str = "MBX_CARGO_SHIM_PATH";
+pub(super) const CARGO_SHIM_DEPTH_ENV: &str = "MBX_CARGO_SHIM_DEPTH";
+pub(super) const CARGO_SHIM_CHAIN_ENV: &str = "MBX_CARGO_SHIM_CHAIN";
+/// Build scripts and Cargo subcommands legitimately reach the shim again, so a
+/// repeat is not proof of a cycle. A real wrapper loop never stops, so a depth
+/// far beyond any plausible nesting is.
+const MAX_CARGO_SHIM_DEPTH: usize = 12;
+const CARGO_SHIM_NOTE_ENV: &str = "MBX_CARGO_SHIM_NOTE";
+/// Whether this process chose the loop note path, and so removes the note.
+static OWNS_LOOP_NOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PATH_BEFORE_SHIM_EXCLUSION: OnceLock<OsString> = OnceLock::new();
 
 /// Whether this process was installed under Cargo's name by `mbx setup`.
@@ -41,6 +50,17 @@ fn is_cargo_shim_path(path: &OsStr) -> bool {
 
 /// Run an invocation received through the persistent Cargo shim.
 pub fn run_cargo_shim() -> Result<ExitCode> {
+    let result = run_cargo_shim_inner();
+    // Passthrough and early exits never read the note a loop may have left.
+    if OWNS_LOOP_NOTE.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(path) = std::env::var_os(CARGO_SHIM_NOTE_ENV)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn run_cargo_shim_inner() -> Result<ExitCode> {
     let reported_shim = std::env::var_os(CARGO_SHIM_PATH_ENV)
         .map(PathBuf::from)
         .or_else(|| {
@@ -65,6 +85,7 @@ pub fn run_cargo_shim() -> Result<ExitCode> {
     let shim_dir = super::setup_install_dir()
         .ok_or_else(|| eyre::eyre!("the platform data directory could not be located"))?;
     let configured_shim = shim_dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    let configured_cargo = std::env::var_os("CARGO");
     let real_cargo = if invoked_via_mise_wrapper {
         resolve_real_cargo(&configured_shim)?
     } else {
@@ -76,6 +97,7 @@ pub fn run_cargo_shim() -> Result<ExitCode> {
         exclude_shim_from_path(&shim)?;
         resolve_real_cargo(&shim)?
     };
+    record_cargo_selection(&real_cargo, configured_cargo.as_deref())?;
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if mbx_disabled() {
         return run_real_cargo(&real_cargo, &arguments);
@@ -107,15 +129,131 @@ pub fn run_cargo_shim() -> Result<ExitCode> {
         None => match failed_probe(&real_cargo, &arguments, target_dir_env.as_deref()) {
             FailedProbe::Roots(roots) => *roots,
             FailedProbe::Passthrough => return run_real_cargo(&real_cargo, &arguments),
-            FailedProbe::Reject => eyre::bail!(
-                "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
-            ),
+            FailedProbe::Reject => {
+                let hint = take_loop_note()
+                    .map(|hint| format!(" ({hint})"))
+                    .unwrap_or_default();
+                eyre::bail!(
+                    "could not verify Cargo build storage: metadata probing failed{hint}; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
+                )
+            }
         },
     };
     // Every probe and the final child must name Cargo directly.
     unsafe { std::env::set_var("CARGO", &real_cargo) };
     let (config, settings) = Config::load_for_cli()?;
     super::cargo::run_with_roots(&config, &settings, &string_arguments, roots)
+}
+
+/// Fail promptly when the "real" Cargo this shim selected leads back into an
+/// mbx shim, as a custom wrapper script that execs mbx does. Each shim entry
+/// exports its depth and the Cargo it selected so the next one can see them.
+fn record_cargo_selection(real_cargo: &OsStr, configured: Option<&OsStr>) -> Result<()> {
+    let depth = std::env::var(CARGO_SHIM_DEPTH_ENV).ok();
+    let chain = std::env::var_os(CARGO_SHIM_CHAIN_ENV);
+    let (depth, chain) =
+        match next_cargo_selection(depth.as_deref(), chain.as_deref(), real_cargo, configured) {
+            Ok(selection) => selection,
+            Err(error) => {
+                leave_loop_note(&format!("{error}"));
+                return Err(error);
+            }
+        };
+    // SAFETY: CLI dispatch is single-threaded here, before any child process
+    // or cache session has started.
+    unsafe { std::env::set_var(CARGO_SHIM_DEPTH_ENV, depth.to_string()) };
+    if let Some(chain) = chain {
+        unsafe { std::env::set_var(CARGO_SHIM_CHAIN_ENV, chain) };
+    }
+    if std::env::var_os(CARGO_SHIM_NOTE_ENV).is_none() {
+        unsafe { std::env::set_var(CARGO_SHIM_NOTE_ENV, loop_note_path()) };
+        OWNS_LOOP_NOTE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Where a re-entered shim leaves its diagnosis for the outermost one. The
+/// roots probe discards its child's stderr, and asking a rejected Cargo to run
+/// again just to read the answer would launch it when nothing was verified.
+fn loop_note_path() -> PathBuf {
+    mbx_cache_cargo::cache_root()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("cargo-shim-loop-{}", std::process::id()))
+}
+
+fn leave_loop_note(message: &str) {
+    let Some(path) = std::env::var_os(CARGO_SHIM_NOTE_ENV) else {
+        return;
+    };
+    if let Some(parent) = Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // `create_new` neither follows a planted link nor replaces a note.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, message.as_bytes());
+    }
+}
+
+fn take_loop_note() -> Option<String> {
+    let path = PathBuf::from(std::env::var_os(CARGO_SHIM_NOTE_ENV)?);
+    let note = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    note.and_then(|note| {
+        note.lines()
+            .find(|line| line.contains("re-entered its Cargo shim"))
+            .map(|line| line.trim().to_string())
+    })
+}
+
+/// The depth and chain to export, given those this shim inherited.
+fn next_cargo_selection(
+    depth: Option<&str>,
+    chain: Option<&OsStr>,
+    real_cargo: &OsStr,
+    configured: Option<&OsStr>,
+) -> Result<(usize, Option<OsString>)> {
+    let depth = depth
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    // Diagnostic history, not a search path: a Cargo path may contain the PATH
+    // separator, so entries are newline-separated and kept as display text.
+    let mut selected = chain
+        .map(|chain| {
+            chain
+                .to_string_lossy()
+                .split('\n')
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    selected.push(PathBuf::from(real_cargo));
+    if depth >= MAX_CARGO_SHIM_DEPTH {
+        let source = if configured == Some(real_cargo) {
+            "the CARGO environment variable"
+        } else {
+            "PATH"
+        };
+        let chain = selected
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        eyre::bail!(
+            "mbx re-entered its Cargo shim {depth} times: the Cargo it selected from {source} ({}) runs mbx again. Selected so far: {chain}. Set CARGO in the outer wrapper to the real Cargo, or remove the wrapper that runs mbx from PATH",
+            Path::new(real_cargo).display()
+        );
+    }
+    let chain = selected
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((depth + 1, Some(OsString::from(chain))))
 }
 
 /// Collection removes a managed target but leaves the checkout's `target` link
@@ -604,6 +742,60 @@ fn run_real_cargo(cargo: &OsStr, arguments: &[OsString]) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_cargo_shim_entry_fails_with_the_selected_cargo() {
+        let cargo = OsStr::new("/usr/local/bin/cargo");
+        let error = next_cargo_selection(
+            Some(&MAX_CARGO_SHIM_DEPTH.to_string()),
+            Some(cargo),
+            cargo,
+            Some(cargo),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("CARGO environment variable"), "{error}");
+        assert!(error.contains("/usr/local/bin/cargo"), "{error}");
+
+        let (depth, chain) =
+            next_cargo_selection(Some("2"), None, OsStr::new("/usr/bin/cargo"), None).unwrap();
+        assert_eq!(depth, 3);
+        assert_eq!(chain.as_deref(), Some(OsStr::new("/usr/bin/cargo")));
+    }
+
+    #[test]
+    fn cargo_shim_chain_keeps_paths_containing_the_path_separator() {
+        let first = OsStr::new("/tmp/rust:nightly/cargo");
+        let (_, chain) = next_cargo_selection(None, None, first, None).unwrap();
+        let error = next_cargo_selection(
+            Some(&MAX_CARGO_SHIM_DEPTH.to_string()),
+            chain.as_deref(),
+            OsStr::new("/usr/bin/cargo"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("/tmp/rust:nightly/cargo -> /usr/bin/cargo"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn first_cargo_shim_entry_starts_the_chain_without_an_empty_entry() {
+        let error = next_cargo_selection(
+            Some(&MAX_CARGO_SHIM_DEPTH.to_string()),
+            None,
+            OsStr::new("/usr/bin/cargo"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Selected so far: /usr/bin/cargo."),
+            "{error}"
+        );
+    }
 
     #[test]
     fn cargo_shim_passthrough_preserves_cargo_namespace_and_toolchains() {
