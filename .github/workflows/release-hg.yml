@@ -1,0 +1,166 @@
+name: release-hg
+
+# The fork's release: Linux musl archives for x86_64 and aarch64 of a `v*-hg.*`
+# tag, with SHA256SUMS and a build provenance attestation.
+#
+# release.yml is upstream's and cannot run here: it needs upstream's Namespace
+# runners and Apple signing secrets, and attaches only once every target has
+# built. This file builds the two targets the fork's users install, on GitHub's
+# own runners, with release.yml's non-PGO musl build steps. It lives in a file
+# of its own so a rebase onto upstream never conflicts with it.
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Fork tag to release, e.g. v1.27.0-hg.1"
+        required: true
+        type: string
+
+concurrency:
+  group: release-hg-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source:
+    name: Resolve release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Refuse a tag that is not the fork's
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-hg\.[0-9]+$ ]] || {
+            echo "::error::$TAG is not a fork tag (v<semver>-hg.<n>)"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          persist-credentials: false
+      - name: Pin the binaries to one commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install Rust target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo --version
+          rustup target add "$TARGET"
+
+      - name: Bootstrap mbx
+        run: |
+          cargo build --package mbx --target-dir target/mbx-bootstrap-build
+          mkdir -p target/mbx-bootstrap
+          cp target/mbx-bootstrap-build/debug/mbx target/mbx-bootstrap/mbx
+
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # As release.yml: aws-lc-sys compiles C, and Debian's musl-tools ships
+      # only `musl-gcc`, not a target-prefixed compiler.
+      - name: Build
+        env:
+          MBX_RELEASE: 1
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: ./target/mbx-bootstrap/mbx build --release --locked --package mbx --target ${{ matrix.target }}
+
+      - name: Check the binary runs
+        run: ./target/${{ matrix.target }}/release/mbx --version
+
+      # The same flat, unversioned archive release.yml makes.
+      - name: Archive
+        run: |
+          notices=(LICENSE)
+          if [[ -f NOTICE ]]; then notices+=(NOTICE); fi
+          cp "${notices[@]}" "target/${{ matrix.target }}/release/"
+          tar -czf "mbx-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" mbx "${notices[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: mbx-${{ matrix.target }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    # Needs both targets: a fork release missing one is the gap this file closes.
+    needs: [source, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 2 ] || {
+            echo "::error::expected two archives"; exit 1; }
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/*.tar.gz
+
+      # A published release is never changed: a draft is completed, a
+      # published one refused.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --draft --verify-tag \
+              --title "mbx $TAG" \
+              --notes "Upstream ${TAG%-hg.*} with the fork's patches. Linux musl builds for x86_64 and aarch64."
+          fi
+          if [[ $(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft) != true ]]; then
+            echo "::error::refusing to change published release $TAG"
+            exit 1
+          fi
+          gh release upload "$TAG" release-assets/* --repo "$REPO" --clobber
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
