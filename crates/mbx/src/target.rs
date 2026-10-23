@@ -36,6 +36,7 @@
 //! through the `target` link and so takes no lease.
 
 use crate::config::Config;
+use crate::disk_usage::{Ledger, Removal};
 use eyre::{Context, Result};
 use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const VIEWS_DIR: &str = "v1";
 /// Marks a view moved aside for removal; never part of a view's own name,
 /// which is a bare hex digest.
-const REMOVAL_SUFFIX: &str = ".removing-";
+pub(crate) const REMOVAL_SUFFIX: &str = ".removing-";
 const VIEW_RECORD_VERSION: u8 = 1;
 /// How recently a view's record must have been refreshed for collection to
 /// treat a build as having just claimed it. Records carry whole seconds, so a
@@ -183,6 +184,14 @@ pub(crate) struct CollectionOutcome {
     /// an interrupted collection had already moved aside. The latter adds
     /// bytes without adding units.
     pub removed_unit_bytes: u64,
+    /// The part of the removed bytes, whole directories and units together,
+    /// whose files had no link outside the managed target directories, so the
+    /// disk got it back. A file also linked from the store or anything else
+    /// outside them stays on disk.
+    pub released_bytes: u64,
+    /// Files deleted, whatever they counted for: in removed directories and
+    /// units, and in leftovers an interrupted collection moved aside.
+    pub deleted_files: u64,
     pub remaining_bytes: u64,
     pub remaining_views: u64,
 }
@@ -191,6 +200,19 @@ impl CollectionOutcome {
     /// Logical bytes removed, whole directories and units together.
     pub(crate) fn freed_bytes(&self) -> u64 {
         self.removed_bytes.saturating_add(self.removed_unit_bytes)
+    }
+
+    /// Whether the collection deleted anything, a directory moved aside
+    /// whose deletion then failed included.
+    pub(crate) fn removed_anything(&self) -> bool {
+        self.removed_views > 0 || self.removed_units > 0 || self.deleted_files > 0
+    }
+
+    /// Credit a deletion of whole directories, or of leftovers of them.
+    fn credit_views(&mut self, removal: &Removal) {
+        self.removed_bytes = self.removed_bytes.saturating_add(removal.release.logical);
+        self.released_bytes = self.released_bytes.saturating_add(removal.release.physical);
+        self.deleted_files = self.deleted_files.saturating_add(removal.deleted_files);
     }
 }
 
@@ -1367,30 +1389,54 @@ fn collect_with(
     mut after_removal: impl FnMut(),
 ) -> Result<CollectionOutcome> {
     let mut outcome = CollectionOutcome::default();
-    if !dry_run {
-        remove_abandoned_removals(root);
-    }
+    // One ledger for the sweep, so a file several views link is counted once,
+    // and is freed only by removing the last of them.
+    let mut ledger = Ledger::default();
+    // Leftovers of a collector that died are measured with the views, so a
+    // file both reach counts once, and are removed once everything is.
+    let abandoned = if dry_run {
+        Vec::new()
+    } else {
+        abandoned_removals(root)
+    };
+    let abandoned = abandoned
+        .into_iter()
+        .map(|leftover| {
+            let measured = ledger.measure(&leftover, &HashSet::new());
+            (leftover, measured)
+        })
+        .collect::<Vec<_>>();
     let mut entries = Vec::new();
     let mut total_views = 0_u64;
-    let mut uncollectable_bytes = 0_u64;
     for (record_path, directory) in views(root)? {
         total_views += 1;
         let Some(record) = read_view_record(&record_path) else {
             // A record this build cannot read names no checkout, and a target
             // directory nobody can trace is not one to delete on a guess.
-            uncollectable_bytes = uncollectable_bytes.saturating_add(tree_bytes(&directory));
+            ledger.measure(&directory, &HashSet::new());
             continue;
         };
-        let bytes = tree_bytes(&directory);
+        let files = ledger.measure(&directory, &HashSet::new());
         entries.push((
             record_path,
             directory,
             record.updated_secs,
-            bytes,
+            files,
             crate::store::checkout_is_live_on(root, &record.workspace_root),
             precedence.standing(&record.workspace_root),
         ));
     }
+    // A file a view still links stays counted there; a deletion that stops
+    // partway leaves what survived in the remaining total.
+    let mut leftovers = Removal::default();
+    for (leftover, measured) in &abandoned {
+        leftovers.add(crate::disk_usage::remove_measured_tree(
+            leftover,
+            &mut ledger,
+            measured,
+        ));
+    }
+    outcome.credit_views(&leftovers);
     let expired = |updated: u64, standing: Standing| {
         standing != Standing::Keep
             && max_age.is_some_and(|age| now.saturating_sub(updated) > age.as_secs())
@@ -1403,7 +1449,7 @@ fn collect_with(
             .any(|entry| entry.4 && entry.5 != Standing::Keep && !expired(entry.2, entry.5))
         && crate::target_units::access_times_tracked(&views_root(root))
     {
-        for (_, directory, updated, bytes, live, standing) in &mut entries {
+        for (_, directory, updated, files, live, standing) in &mut entries {
             // A kept target keeps what it holds: one built for a bisect or a
             // release and left alone is exactly one whose units look unused.
             if !*live || *standing == Standing::Keep || expired(*updated, *standing) {
@@ -1448,28 +1494,37 @@ fn collect_with(
                 max_age,
                 UNIX_EPOCH + Duration::from_secs(now),
                 dry_run,
+                &mut ledger,
             );
-            *bytes = bytes.saturating_sub(units.removed_bytes);
+            // The view no longer holds what went, so removing it later must
+            // not count those files again.
+            files.forget(&units.removal);
             outcome.removed_units += units.removed_units;
-            outcome.removed_unit_bytes += units.removed_bytes;
+            outcome.removed_unit_bytes += units.removal.release.logical;
+            outcome.released_bytes += units.removal.release.physical;
+            outcome.deleted_files += units.removal.deleted_files;
         }
     }
-    let mut remaining = entries
-        .iter()
-        .map(|entry| entry.3)
-        .fold(uncollectable_bytes, u64::saturating_add);
+    // A budget weighs each view by what removing it would free given the
+    // views selected before it, released from a copy of the ledger: a file
+    // two views link frees nothing until both are selected, and then counts
+    // in full.
+    let mut projection = max_bytes.map(|_| ledger.clone());
+    let mut remaining = ledger.total();
     let mut selected = HashSet::new();
-    for (record_path, _, updated, bytes, live, standing) in &entries {
+    for (record_path, _, updated, files, live, standing) in &entries {
         if !live || expired(*updated, *standing) {
             selected.insert(record_path.clone());
-            remaining = remaining.saturating_sub(*bytes);
+            if let Some(projection) = &mut projection {
+                remaining = remaining.saturating_sub(projection.release(files).logical);
+            }
         }
     }
-    if let Some(max_bytes) = max_bytes
+    if let (Some(max_bytes), Some(projection)) = (max_bytes, projection.as_mut())
         && remaining > max_bytes
     {
         entries.sort_by_key(|entry| entry.2);
-        let mut candidates: Vec<&(PathBuf, PathBuf, u64, u64, bool, Standing)> = entries
+        let mut candidates: Vec<_> = entries
             .iter()
             .filter(|entry| !selected.contains(&entry.0) && entry.5 != Standing::Keep)
             .collect();
@@ -1480,7 +1535,7 @@ fn collect_with(
                 break;
             }
             if selected.insert(entry.0.clone()) {
-                remaining = remaining.saturating_sub(entry.3);
+                remaining = remaining.saturating_sub(projection.release(&entry.3).logical);
             }
         }
         if remaining > max_bytes {
@@ -1493,7 +1548,7 @@ fn collect_with(
     }
 
     before_removal();
-    for (record_path, directory, updated, bytes, live, _) in entries {
+    for (record_path, directory, updated, files, live, _) in entries {
         if !selected.contains(&record_path) {
             continue;
         }
@@ -1520,14 +1575,12 @@ fn collect_with(
             // that listed it for removal would be wrong about it.
             if view_in_use(&directory) {
                 outcome.kept_active_views += 1;
-                remaining = remaining.saturating_add(bytes);
                 continue;
             }
             None
         } else {
             let Some(reservation) = try_reserve_view(&directory) else {
                 outcome.kept_active_views += 1;
-                remaining = remaining.saturating_add(bytes);
                 continue;
             };
             while_reserved(&directory);
@@ -1548,7 +1601,6 @@ fn collect_with(
             };
             if claimed_since || in_use {
                 outcome.kept_active_views += 1;
-                remaining = remaining.saturating_add(bytes);
                 continue;
             }
         }
@@ -1575,7 +1627,15 @@ fn collect_with(
         let aside = match aside {
             Ok(aside) => {
                 outcome.removed_views += 1;
-                outcome.removed_bytes += bytes;
+                if dry_run {
+                    // What deleting it would free, given the views before it.
+                    // Released by its measure, not by a walk without deleting:
+                    // in a dry run the units pruned from it are still there.
+                    outcome.credit_views(&Removal {
+                        release: ledger.release(&files),
+                        ..Removal::default()
+                    });
+                }
                 if live {
                     outcome.removed_live_views += 1;
                 } else {
@@ -1584,6 +1644,9 @@ fn collect_with(
                 aside
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Something else removed it: gone from what remains, but not
+                // freed by this collection.
+                ledger.release(&files);
                 outcome.removed_views += 1;
                 if live {
                     outcome.removed_live_views += 1;
@@ -1593,7 +1656,6 @@ fn collect_with(
                 None
             }
             Err(error) => {
-                remaining = remaining.saturating_add(bytes);
                 log::warn!(
                     "could not remove the target directory {}: {error}",
                     directory.display()
@@ -1626,25 +1688,17 @@ fn collect_with(
             );
         }
         drop(reservation);
-        if let Some(aside) = aside
-            && let Err(error) = std::fs::remove_dir_all(&aside)
-        {
-            // The view stays counted as removed: it is gone from the path a
-            // build can reach, and the next collection finishes deleting what
-            // was left aside. Whatever is still on the disk until then goes
-            // back to what remains rather than to what was freed, measured
-            // rather than assumed, since a deletion that fails partway has
-            // freed the rest.
-            let left = tree_bytes(&aside);
-            outcome.removed_bytes = outcome.removed_bytes.saturating_sub(left);
-            remaining = remaining.saturating_add(left);
-            log::warn!(
-                "could not remove the retired target directory {}: {error}",
-                aside.display()
-            );
+        if let Some(aside) = aside {
+            // Each file is credited once it is gone. Should the deletion
+            // fail partway, the view stays counted as removed: it is gone
+            // from the path a build can reach, and the next collection
+            // finishes deleting what was left aside. What is still on the
+            // disk until then stays in what remains.
+            let removal = crate::disk_usage::remove_measured_tree(&aside, &mut ledger, &files);
+            outcome.credit_views(&removal);
         }
     }
-    outcome.remaining_bytes = remaining;
+    outcome.remaining_bytes = ledger.total();
     outcome.remaining_views = total_views.saturating_sub(outcome.removed_views);
     Ok(outcome)
 }
@@ -1703,22 +1757,24 @@ fn removal_path(directory: &Path) -> PathBuf {
     ))
 }
 
-/// Finish removing views a collector that died left moved aside.
+/// Views a collector that died left moved aside, for this sweep to finish
+/// removing.
 ///
 /// They have no record, so nothing else lists or protects them; a collector
 /// still deleting one holds no lock either, but the removal is idempotent and
 /// two of them racing only means the files go sooner.
-fn remove_abandoned_removals(root: &Path) {
+fn abandoned_removals(root: &Path) -> Vec<PathBuf> {
     let Ok(listing) = std::fs::read_dir(views_root(root)) else {
-        return;
+        return Vec::new();
     };
-    for entry in listing.flatten() {
-        if entry.file_name().to_string_lossy().contains(REMOVAL_SUFFIX)
-            && entry.file_type().is_ok_and(|kind| kind.is_dir())
-        {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
+    listing
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().contains(REMOVAL_SUFFIX)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 /// Every managed target directory under `root`, as record and directory.
@@ -1810,39 +1866,16 @@ fn view_key(workspace_root: &Path) -> String {
     CacheDigest::blake3(workspace_root.to_string_lossy().as_bytes()).hash
 }
 
-pub(crate) fn tree_bytes(directory: &Path) -> u64 {
-    let mut total = 0;
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(listing) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in listing.flatten() {
-            // Symlinks are not followed: a link's target is either inside this
-            // tree and already counted, or outside it and not ours to count.
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file()
-                && let Ok(metadata) = entry.metadata()
-            {
-                total += metadata.len();
-            }
-        }
-    }
-    total
-}
+pub(crate) use crate::disk_usage::tree_bytes;
 
-/// [`tree_bytes`] summed over `roots`, walked by several threads.
+/// The bytes under all of `roots`, walked by several threads, each file
+/// counted once however many links inside them reach it.
 ///
 /// Sizing is a stat per file, and a machine with many checkouts has millions of
 /// them, so one thread spends nearly all its time waiting on the filesystem.
 /// Directories go onto a shared queue that every worker pulls from, so one
 /// enormous target tree is split up rather than left to a single thread.
 pub(crate) fn trees_bytes(roots: Vec<PathBuf>) -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Condvar, Mutex};
 
     const MAX_WORKERS: usize = 8;
@@ -1856,14 +1889,14 @@ pub(crate) fn trees_bytes(roots: Vec<PathBuf>) -> u64 {
         busy: 0,
     });
     let ready = Condvar::new();
-    let total = AtomicU64::new(0);
+    let total = Mutex::new(Ledger::default());
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .clamp(1, MAX_WORKERS);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                let mut bytes = 0;
+                let mut ledger = Ledger::default();
                 loop {
                     let next = {
                         let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1890,7 +1923,7 @@ pub(crate) fn trees_bytes(roots: Vec<PathBuf>) -> u64 {
                             } else if file_type.is_file()
                                 && let Ok(metadata) = entry.metadata()
                             {
-                                bytes += metadata.len();
+                                ledger.count(|| entry.path(), &metadata);
                             }
                         }
                     }
@@ -1899,11 +1932,17 @@ pub(crate) fn trees_bytes(roots: Vec<PathBuf>) -> u64 {
                     queue.busy -= 1;
                     ready.notify_all();
                 }
-                total.fetch_add(bytes, Ordering::Relaxed);
+                total
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .merge(ledger);
             });
         }
     });
-    total.into_inner()
+    total
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .total()
 }
 
 #[cfg(test)]
