@@ -609,6 +609,12 @@ pub(crate) fn compile(
             .chain(std::iter::once(&outputs.dep_info))
             .map(PathBuf::as_path),
     );
+    // The unit's objects from earlier compilations, recorded last so that
+    // everything older than this compilation is in it.
+    let mut objects = crate::object_cleanup::ObjectSnapshot::before_compiling(
+        &profile_arguments(&arguments),
+        &working_dir,
+    );
     // Bootstrap may be visible to env!/option_env!. Hold notifications too:
     // Cargo must not give dependents metadata that the retry will discard.
     let held = seed_mode == IncrementalSeedMode::Inject { bootstrap: true };
@@ -731,6 +737,9 @@ pub(crate) fn compile(
             "build-script inputs were not validated: {error:#}"
         ));
         if verification.is_none() {
+            if let Some(objects) = objects.take() {
+                objects.remove_superseded(&output.status);
+            }
             if !forwarded {
                 replay_bytes(&output.stdout, &output.stderr)?;
             }
@@ -775,6 +784,9 @@ pub(crate) fn compile(
                 &cached.action,
                 &divergence,
             ));
+        }
+        if let Some(objects) = objects.take() {
+            objects.remove_superseded(&output.status);
         }
         if !forwarded {
             let _ = replay_output(&output);
@@ -887,6 +899,9 @@ pub(crate) fn compile(
                 session::report_shim_warning(&format!("result was not stored: {error:#}"));
             }
         }
+    }
+    if !compiler_input_invalid && let Some(objects) = objects.take() {
+        objects.remove_superseded(&output.status);
     }
     session::check_low_disk_after_compile();
     session::record_compiler_invocation_with_diagnostic(
@@ -1164,6 +1179,10 @@ fn compile_execution_only_build_script(
             .chain(std::iter::once(&outputs.dep_info))
             .map(PathBuf::as_path),
     );
+    let objects = crate::object_cleanup::ObjectSnapshot::before_compiling(
+        &profile_arguments(arguments),
+        working_dir,
+    );
     let output =
         run_compiler(&mut command, forwarded, false).wrap_err("failed to execute rustc")?;
     drop(permit);
@@ -1193,6 +1212,10 @@ fn compile_execution_only_build_script(
         session::report_shim_warning(&format!(
             "build-script inputs were not validated: {error:#}"
         ));
+    }
+    // A discarded result returned above, keeping the earlier objects.
+    if let Some(objects) = objects {
+        objects.remove_superseded(&output.status);
     }
     if output.status.success()
         && let Some(executable) = cargo_build_script_executable(outputs, invocation)
@@ -1325,7 +1348,7 @@ fn compiler_sysroot(rustc: &OsStr) -> Option<PathBuf> {
 }
 
 /// The value of `--flag=VALUE` or `--flag VALUE`, whichever comes first.
-fn flag_value(arguments: &[OsString], flag: &str) -> Option<String> {
+pub(crate) fn flag_value(arguments: &[OsString], flag: &str) -> Option<String> {
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         if argument == flag {
