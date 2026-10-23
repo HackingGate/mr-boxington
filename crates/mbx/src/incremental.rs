@@ -1,5 +1,6 @@
 //! Persistent per-checkout state for learned incremental compilation.
 
+use crate::retired::{self, RetiredTree};
 use eyre::{Context, Result};
 use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,123 @@ const RECORD_FILE: &str = "checkout.json";
 const RECORD_VERSION: u8 = 1;
 const LOCKS_DIR: &str = ".locks";
 const REGISTRAR_FILE: &str = "registrar.lock";
+const EPOCH_FILE: &str = "epoch";
+const COPY_STATE_EPOCH: u64 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct StateEpoch {
+    epoch: u64,
+    pending: Vec<String>,
+}
+
+fn read_epoch(root: &Path) -> Option<StateEpoch> {
+    serde_json::from_slice(&std::fs::read(root.join(EPOCH_FILE)).ok()?).ok()
+}
+
+fn copy_state_ready(root: &Path) -> bool {
+    read_epoch(root)
+        .is_some_and(|state| state.epoch >= COPY_STATE_EPOCH && state.pending.is_empty())
+}
+
+/// Older seeds shared writable files, and corruption can remain after the
+/// links disappear. Discard all old state once, waiting for active builds.
+fn discard_pre_copy_state(root: &Path) -> Result<()> {
+    if copy_state_ready(root) {
+        return Ok(());
+    }
+    let registrar_path = registrar_path(root);
+    std::fs::create_dir_all(registrar_path.parent().expect("registrar has a parent"))?;
+    let mut registrar = fslock::LockFile::open(&registrar_path)?;
+    registrar.lock()?;
+    let state = read_epoch(root);
+    let state = match state {
+        Some(state) if state.epoch >= COPY_STATE_EPOCH => state,
+        _ => {
+            let mut pending = Vec::new();
+            for entry in std::fs::read_dir(root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && entry.file_name() != LOCKS_DIR
+                    && !retired::is_retired_name(&entry.file_name())
+                {
+                    pending.push(
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| eyre::eyre!("incremental checkout name is not UTF-8"))?,
+                    );
+                }
+            }
+            pending.sort();
+            let state = StateEpoch {
+                epoch: COPY_STATE_EPOCH,
+                pending,
+            };
+            // Save the original set before renaming anything. After a crash,
+            // newly created checkouts must not become migration candidates.
+            crate::util::write_atomic(&root.join(EPOCH_FILE), &serde_json::to_vec(&state)?)?;
+            state
+        }
+    };
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    let mut pending = Vec::new();
+    let mut retired_count = 0;
+    for key in state.pending {
+        let result = (|| -> Result<bool> {
+            // Epoch keys name direct children, never paths outside the root.
+            if Path::new(&key).components().count() != 1
+                || !matches!(
+                    Path::new(&key).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+                || key == LOCKS_DIR
+                || retired::is_retired_name(key.as_ref())
+            {
+                eyre::bail!("invalid incremental checkout key {key:?}");
+            }
+            let locks = lock_dir(root, &key);
+            if probe_leases(&locks, true)? {
+                return Ok(false);
+            }
+            if let Some(tree) = RetiredTree::retire(&root.join(&key))? {
+                match std::fs::remove_file(tree.path().join(RECORD_FILE)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        // Leave a failed retirement at its original name so
+                        // the pending key still refers to the old state.
+                        std::fs::rename(tree.path(), root.join(&key))?;
+                        return Err(error.into());
+                    }
+                }
+                retired_count += 1;
+            }
+            cleanup_lock_dir(&locks);
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => {}
+            Ok(false) => pending.push(key),
+            Err(error) => {
+                log::warn!("could not discard old incremental state for {key}: {error}");
+                pending.push(key);
+            }
+        }
+    }
+    crate::util::write_atomic(
+        &root.join(EPOCH_FILE),
+        &serde_json::to_vec(&StateEpoch { pending, ..state })?,
+    )?;
+    drop(registrar);
+    if retired_count > 0 {
+        log::info!(
+            "discarded incremental state from {retired_count} checkouts left by an older mbx version; it will be rebuilt because hard-linked seeds could overwrite another checkout's state"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +210,7 @@ pub(crate) struct Checkout {
 
 /// Refresh one checkout's claim, mark it active, and return its private state.
 pub(crate) fn touch(root: &Path, workspace_root: &Path) -> Result<Checkout> {
+    discard_pre_copy_state(root)?;
     let key = checkout_key(workspace_root);
     let directory = root.join(&key);
     let lease = acquire_lease(root, &key)?;
@@ -141,7 +260,10 @@ pub(crate) fn workspaces(root: &Path) -> Result<Vec<PathBuf>> {
     let mut workspaces = Vec::new();
     for entry in listing {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() || entry.file_name() == LOCKS_DIR {
+        if !entry.file_type()?.is_dir()
+            || entry.file_name() == LOCKS_DIR
+            || retired::is_retired_name(&entry.file_name())
+        {
             continue;
         }
         if let Some(record) = read_record(&entry.path().join(RECORD_FILE)) {
@@ -169,6 +291,7 @@ pub(crate) fn collect(
     hot_floor: bool,
     backstop_budget: Option<u64>,
 ) -> Result<PruneOutcome> {
+    let swept_bytes = sweep_retired(root, dry_run);
     let now = now_secs();
     let Snapshot {
         entries,
@@ -360,6 +483,7 @@ pub(crate) fn collect(
             .iter()
             .any(|unit| {
                 unit.file_type().is_ok_and(|kind| kind.is_dir())
+                    && !retired::is_retired_name(&unit.file_name())
                     && (!dry_run || !removed.contains(&unit.path()))
             })
         {
@@ -375,7 +499,10 @@ pub(crate) fn collect(
             }
         }
     }
-    outcome.removed_bytes = outcome.remaining_bytes.saturating_sub(inodes.bytes);
+    outcome.removed_bytes = outcome
+        .remaining_bytes
+        .saturating_sub(inodes.bytes)
+        .saturating_add(swept_bytes);
     outcome.remaining_bytes = inodes.bytes;
     outcome.skipped_active_directories = active.len() as u64;
     outcome.remaining_directories -= outcome.removed_directories;
@@ -397,6 +524,71 @@ pub(crate) fn collect(
 /// Remove a tree or a single file, one file at a time. A file whose last
 /// link goes is forgotten in the ledger whichever owners still reference it:
 /// the data is gone. Other files are released by their owners as before.
+/// Delete retired trees a crash or an upgrade left behind, returning the bytes
+/// freed. A preview deletes nothing and returns what deleting would free.
+///
+/// They are outside the sweep's snapshot, so they get an accounting of their
+/// own under the same rule unit removal follows: all of them are measured
+/// together and a file is credited only when its last link goes. A file
+/// linked from two retired trees counts once, and one still linked from a
+/// live checkout frees nothing.
+fn sweep_retired(root: &Path, dry_run: bool) -> u64 {
+    let mut trees = retired_children(root);
+    for entry in nested_entries(root) {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.file_name() != LOCKS_DIR
+            && !retired::is_retired_name(&entry.file_name())
+        {
+            trees.extend(retired_children(&entry.path().join("blake3")));
+        }
+    }
+    if dry_run {
+        return reclaimable(&trees);
+    }
+    let mut inodes = Inodes::default();
+    for tree in &trees {
+        inodes.measure(tree, &HashSet::new());
+    }
+    let measured = inodes.bytes;
+    for tree in &trees {
+        remove_tree(tree, false, &mut inodes);
+    }
+    measured.saturating_sub(inodes.bytes)
+}
+
+/// What deleting `trees` would free: each file once, and only when every link
+/// it has is inside them, which is when a real removal would credit it.
+fn reclaimable(trees: &[PathBuf]) -> u64 {
+    let mut files: HashMap<FileKey, (u64, u64, Option<u64>)> = HashMap::new();
+    for tree in trees {
+        let mut pending = vec![tree.clone()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.extend(nested_entries(&path).into_iter().map(|entry| entry.path()));
+            } else if metadata.is_file() {
+                let (key, links) = file_identity(&path, &metadata);
+                files.entry(key).or_insert((metadata.len(), 0, links)).1 += 1;
+            }
+        }
+    }
+    files
+        .values()
+        .filter(|(_, seen, links)| links.is_some_and(|links| *seen >= links))
+        .map(|(bytes, ..)| bytes)
+        .sum()
+}
+
+fn retired_children(parent: &Path) -> Vec<PathBuf> {
+    nested_entries(parent)
+        .into_iter()
+        .filter(|entry| retired::is_retired_name(&entry.file_name()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
 fn remove_tree(directory: &Path, dry_run: bool, inodes: &mut Inodes) -> bool {
     if dry_run {
         return true;
@@ -499,6 +691,9 @@ fn units(directory: &Path, inodes: &mut Inodes) -> (Vec<Unit>, Vec<(PathBuf, Vec
     let mut units = Vec::new();
     let mut orphans = Vec::new();
     for entry in nested_entries(&directory.join("blake3")) {
+        if retired::is_retired_name(&entry.file_name()) {
+            continue;
+        }
         let Ok(kind) = entry.file_type() else {
             continue;
         };
@@ -986,7 +1181,10 @@ fn entries(root: &Path) -> Result<Snapshot> {
                 continue;
             }
         };
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || entry.file_name() == LOCKS_DIR {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || entry.file_name() == LOCKS_DIR
+            || retired::is_retired_name(&entry.file_name())
+        {
             continue;
         }
         let directory = entry.path();
@@ -998,6 +1196,12 @@ fn entries(root: &Path) -> Result<Snapshot> {
             .collect::<HashSet<_>>();
         excluded.extend(units.iter().flat_map(|unit| unit.records.iter().cloned()));
         excluded.extend(orphan_stamps.iter().map(|(stamp, _)| stamp.clone()));
+        excluded.extend(
+            nested_entries(&directory.join("blake3"))
+                .into_iter()
+                .filter(|entry| retired::is_retired_name(&entry.file_name()))
+                .map(|entry| entry.path()),
+        );
         let files = snapshot.inodes.measure(&directory, &excluded);
         snapshot.entries.push(Entry {
             key: entry.file_name().to_string_lossy().into_owned(),
@@ -1110,17 +1314,21 @@ fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard
     std::fs::create_dir_all(registrar_path.parent().expect("registrar has a parent"))?;
     let mut registrar = fslock::LockFile::open(&registrar_path)?;
     registrar.lock()?;
+    let active = probe_leases(&locks, cleanup)?;
+    Ok(DeletionGuard {
+        _registrar: cleanup.then_some(registrar),
+        locks,
+        active,
+        cleanup,
+    })
+}
+
+/// The caller holds the registrar so no lease can be registered mid-probe.
+fn probe_leases(locks: &Path, cleanup: bool) -> Result<bool> {
     let mut active = false;
-    let listing = match std::fs::read_dir(&locks) {
+    let listing = match std::fs::read_dir(locks) {
         Ok(listing) => listing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DeletionGuard {
-                _registrar: cleanup.then_some(registrar),
-                locks,
-                active,
-                cleanup,
-            });
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
     for entry in listing {
@@ -1138,12 +1346,7 @@ fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard
             active = true;
         }
     }
-    Ok(DeletionGuard {
-        _registrar: cleanup.then_some(registrar),
-        locks,
-        active,
-        cleanup,
-    })
+    Ok(active)
 }
 
 fn cleanup_lock_dir(locks: &Path) {
@@ -1172,21 +1375,24 @@ fn cleanup_lock_dir(locks: &Path) {
 /// leaves no partial state; a donor that cannot be copied gives way to the
 /// next.
 ///
-/// Files are hard-linked. rustc writes a session once, into a directory of
-/// its own, and links what it reuses into the next one rather than changing
-/// it, so sharing them is as safe as rustc's own reuse. A clone would be just
-/// as correct, but it is a new file: the donor's pages in the file cache do
-/// not carry over, and the first compilation rereads every object and bitcode
-/// file in the state. Lock files, which rustc locks rather than reads, are
-/// copied, and so is any file that cannot be linked.
+/// Files are independent copies, using a filesystem clone where supported.
+/// rustc can rewrite inherited files in place (including ThinLTO bitcode),
+/// so hard links would let a later compilation change the donor's session.
 pub(crate) fn seed(checkout: &Path, unit: &str) -> Result<Option<PathBuf>> {
     let (Some(root), Some(own)) = (checkout.parent(), checkout.file_name()) else {
         return Ok(None);
     };
+    if !copy_state_ready(root) {
+        return Ok(None);
+    }
     let mut donors = Vec::new();
     for entry in std::fs::read_dir(root)?.flatten() {
         let name = entry.file_name();
-        if name == own || name == LOCKS_DIR || !entry.path().join(unit).is_dir() {
+        if name == own
+            || name == LOCKS_DIR
+            || retired::is_retired_name(&name)
+            || !entry.path().join(unit).is_dir()
+        {
             continue;
         }
         if let Some(record) = read_record(&entry.path().join(RECORD_FILE)) {
@@ -1375,16 +1581,18 @@ fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Hard-link a state file, or copy it: a lock file, which rustc locks rather
-/// than reads, or one that cannot be linked.
+/// Copy a state file without sharing its inode with the donor. The enclosing
+/// staging directory keeps partial copies out of rustc's session search.
 fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    let lock = from
-        .extension()
-        .is_some_and(|extension| extension == "lock");
-    if lock || std::fs::hard_link(from, to).is_err() {
-        std::fs::copy(from, to)?;
-    }
-    Ok(())
+    let modified = std::fs::metadata(from)?.modified()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    reflink_copy::reflink_or_copy(from, to)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    std::fs::copy(from, to)?;
+    // rustc selects sessions by the timestamp in their name, but keep the
+    // original mtime too, independent of the platform's copy implementation.
+    crate::materialize::set_modified(to, modified)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 fn read_record(path: &Path) -> Option<CheckoutRecord> {
@@ -1401,7 +1609,7 @@ fn now_secs() -> u64 {
 }
 
 // A sweep owns one reference per unit (and per bookkeeping tree), even if
-// multiple session paths in that owner hard-link the same immutable file.
+// multiple session paths in that owner hard-link the same file.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum FileKey {
     Object(u64, u64),
@@ -2735,6 +2943,8 @@ mod tests {
         unit: &str,
         sessions: &[&str],
     ) -> PathBuf {
+        crate::util::write_advisory(&cache.join(EPOCH_FILE), br#"{"epoch":1,"pending":[]}"#)
+            .unwrap();
         let directory = cache.join(key);
         for session in sessions {
             let session = directory.join(unit).join("widget-0abc").join(session);
@@ -2760,6 +2970,174 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    fn retired_checkouts(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| retired::is_retired_name(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[test]
+    fn upgrading_discards_shared_state_once_and_collection_sweeps_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let unit = "blake3/0123456789";
+        let own = checkout_with_sessions(
+            cache.path(),
+            &checkout_key(workspace.path()),
+            10,
+            unit,
+            &["s-1-a-finished"],
+        );
+        let donor = checkout_with_sessions(cache.path(), "donor", 20, unit, &["s-2-b-finished"]);
+        let source = own
+            .join(unit)
+            .join("widget-0abc/s-1-a-finished/state.pre-lto.bc");
+        std::fs::write(&source, b"shared bitcode").unwrap();
+        std::fs::hard_link(
+            &source,
+            donor
+                .join(unit)
+                .join("widget-0abc/s-2-b-finished/state.pre-lto.bc"),
+        )
+        .unwrap();
+        std::fs::remove_file(cache.path().join(EPOCH_FILE)).unwrap();
+
+        let checkout = touch(cache.path(), workspace.path()).unwrap();
+        assert_eq!(checkout.directory, own);
+        assert!(!own.join(unit).exists());
+        assert!(!donor.exists());
+        assert_eq!(
+            std::fs::read(cache.path().join(EPOCH_FILE)).unwrap(),
+            br#"{"epoch":1,"pending":[]}"#
+        );
+        let retired = retired_checkouts(cache.path());
+        assert_eq!(retired.len(), 2);
+        assert!(retired.iter().all(|path| !path.join(RECORD_FILE).exists()));
+        // The shared bitcode is one file linked from both trees: it is freed,
+        // and counted, once.
+        let mut measured = Inodes::default();
+        for path in &retired {
+            measured.measure(path, &HashSet::new());
+        }
+        let bytes = measured.bytes;
+        assert!(bytes < retired.iter().map(|path| tree_bytes(path)).sum::<u64>());
+        assert!(bytes >= b"shared bitcode".len() as u64);
+        assert_eq!(stats(cache.path()).unwrap().directories, 1);
+        assert_eq!(stats(cache.path()).unwrap().units, 0);
+        assert_eq!(workspaces(cache.path()).unwrap(), [workspace.path()]);
+        let preview = collect(cache.path(), None, None, true, false, None).unwrap();
+        assert_eq!(preview.removed_bytes, bytes);
+        assert!(retired.iter().all(|path| path.exists()));
+        let outcome = collect(cache.path(), None, None, false, false, None).unwrap();
+        assert_eq!(outcome.removed_bytes, bytes);
+        assert!(retired.iter().all(|path| !path.exists()));
+        std::fs::write(own.join("new-state"), b"keep").unwrap();
+        drop(checkout);
+        let _next = touch(cache.path(), workspace.path()).unwrap();
+        assert!(own.join("new-state").exists());
+        assert!(retired_checkouts(cache.path()).is_empty());
+    }
+
+    #[test]
+    fn upgrading_defers_active_checkouts_and_never_discards_new_ones() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let unit = "blake3/0123456789";
+        let busy = checkout_with_sessions(cache.path(), "busy", 20, unit, &["s-2-b-finished"]);
+        checkout_with_sessions(cache.path(), "idle", 10, unit, &["s-1-a-finished"]);
+        std::fs::remove_file(cache.path().join(EPOCH_FILE)).unwrap();
+        let lease = acquire_lease(cache.path(), "busy").unwrap();
+        assert!(deletion_guard(cache.path(), "busy", false).unwrap().active);
+        let checkout = touch(cache.path(), workspace.path()).unwrap();
+        assert_eq!(read_epoch(cache.path()).unwrap().pending, ["busy"]);
+        assert!(busy.exists());
+        assert!(!cache.path().join("idle").exists());
+        assert_eq!(seed(&checkout.directory, unit).unwrap(), None);
+
+        let fresh_workspace = tempfile::tempdir().unwrap();
+        let fresh = touch(cache.path(), fresh_workspace.path()).unwrap();
+        let session = fresh
+            .directory
+            .join(unit)
+            .join("widget-0abc/s-3-c-finished");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("dep-graph.bin"), b"fresh state").unwrap();
+        std::fs::write(session.with_file_name("s-3-c.lock"), b"").unwrap();
+        drop(fresh);
+        let again = touch(cache.path(), workspace.path()).unwrap();
+        assert!(session.exists());
+        assert_eq!(read_epoch(cache.path()).unwrap().pending, ["busy"]);
+        assert_eq!(seed(&again.directory, unit).unwrap(), None);
+        drop(lease);
+        let _last = touch(cache.path(), workspace.path()).unwrap();
+        assert!(!busy.exists());
+        assert!(session.exists());
+        assert!(copy_state_ready(cache.path()));
+        assert_eq!(
+            seed(&checkout.directory, unit).unwrap(),
+            Some(fresh_workspace.path().to_path_buf())
+        );
+        assert_eq!(
+            std::fs::read(
+                checkout
+                    .directory
+                    .join(unit)
+                    .join("widget-0abc/s-3-c-finished/dep-graph.bin")
+            )
+            .unwrap(),
+            b"fresh state"
+        );
+        assert!(!lock_dir(cache.path(), "busy").exists());
+    }
+
+    #[test]
+    fn fresh_roots_record_the_copy_epoch_without_retiring_anything() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("incremental");
+        let workspace = tempfile::tempdir().unwrap();
+        let _checkout = touch(&root, workspace.path()).unwrap();
+        assert_eq!(
+            std::fs::read(root.join(EPOCH_FILE)).unwrap(),
+            br#"{"epoch":1,"pending":[]}"#
+        );
+        assert!(retired_checkouts(&root).is_empty());
+        assert_eq!(stats(&root).unwrap().directories, 1);
+        assert_eq!(workspaces(&root).unwrap(), [workspace.path()]);
+        let outcome = collect(&root, None, None, false, false, None).unwrap();
+        assert_eq!(outcome.remaining_directories, 1);
+        assert_eq!(outcome.removed_bytes, 0);
+    }
+
+    #[test]
+    fn seeding_waits_for_a_readable_complete_copy_epoch() {
+        let cache = tempfile::tempdir().unwrap();
+        let unit = "blake3/0123456789";
+        let own = checkout_with_sessions(cache.path(), "own", 40, unit, &[]);
+        checkout_with_sessions(cache.path(), "donor", 20, unit, &["s-2-b-finished"]);
+        std::fs::remove_file(cache.path().join(EPOCH_FILE)).unwrap();
+        assert_eq!(seed(&own, unit).unwrap(), None);
+        for content in [
+            "invalid JSON",
+            r#"{"epoch":0,"pending":[]}"#,
+            r#"{"epoch":1,"pending":["donor"]}"#,
+        ] {
+            std::fs::write(cache.path().join(EPOCH_FILE), content).unwrap();
+            assert_eq!(seed(&own, unit).unwrap(), None);
+        }
+        std::fs::write(
+            cache.path().join(EPOCH_FILE),
+            br#"{"epoch":2,"pending":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            seed(&own, unit).unwrap(),
+            Some(PathBuf::from("/work/donor"))
+        );
     }
 
     #[test]
@@ -2794,10 +3172,10 @@ mod tests {
             use std::os::unix::fs::MetadataExt as _;
             let donor = cache.path().join("newer").join(unit).join("widget-0abc");
             let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
-            assert_eq!(
+            assert_ne!(
                 inode(&copied.join("s-2-b-finished/dep-graph.bin")),
                 inode(&donor.join("s-2-b-finished/dep-graph.bin")),
-                "state files are shared, not copied"
+                "state files must have independent inodes"
             );
             assert_ne!(
                 inode(&copied.join("s-2-b.lock")),
@@ -2805,6 +3183,19 @@ mod tests {
                 "lock files are not shared"
             );
         }
+        let original = cache
+            .path()
+            .join("newer")
+            .join(unit)
+            .join("widget-0abc/s-2-b-finished/dep-graph.bin");
+        let copy = copied.join("s-2-b-finished/dep-graph.bin");
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            std::fs::metadata(&copy).unwrap().modified().unwrap()
+        );
+        // Model rustc truncating and rewriting an inherited session file.
+        std::fs::write(&copy, b"rewritten by recipient").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"newer");
         assert_eq!(
             std::fs::read_dir(own.join("blake3")).unwrap().count(),
             1,
