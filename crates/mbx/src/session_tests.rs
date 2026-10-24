@@ -2249,19 +2249,48 @@ fn seed_incremental_shim_does_not_read_the_user_override() {
 #[test]
 fn session_directory_prefers_an_existing_absolute_runtime_directory() {
     let runtime = tempfile::tempdir().unwrap();
-    let fallback = PathBuf::from("/fallback");
-    assert_eq!(
-        session_dir_base(Some(runtime.path().as_os_str()), fallback.clone()),
-        runtime.path()
-    );
+    let fallback = tempfile::tempdir().unwrap();
+    let session =
+        create_session_dir_in("s", Some(runtime.path().as_os_str()), fallback.path()).unwrap();
+    assert_eq!(session.path().parent(), Some(runtime.path()));
     for unusable in [
         Some(OsStr::new("")),
         Some(OsStr::new("relative/run")),
         Some(OsStr::new("/nonexistent/run/user")),
         None,
     ] {
-        assert_eq!(session_dir_base(unusable, fallback.clone()), fallback);
+        let session = create_session_dir_in("s", unusable, fallback.path()).unwrap();
+        assert_eq!(session.path().parent(), Some(fallback.path()));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_directory_falls_back_when_the_runtime_directory_refuses_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let session = create_session_dir_in("s", Some(runtime.path().as_os_str()), fallback.path());
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(session.unwrap().path().parent(), Some(fallback.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn session_directory_falls_back_when_the_runtime_directory_is_too_long_for_the_socket() {
+    let base = tempfile::tempdir().unwrap();
+    let runtime = base
+        .path()
+        .join("d".repeat(crate::session::socket_path_limit()));
+    std::fs::create_dir(&runtime).unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let session = create_session_dir_in("s", Some(runtime.as_os_str()), fallback.path()).unwrap();
+    assert_eq!(session.path().parent(), Some(fallback.path()));
+    assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0);
 }
 
 #[cfg(unix)]
