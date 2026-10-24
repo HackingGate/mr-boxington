@@ -413,7 +413,7 @@ fn cargo_with_settings_bypass_log_and_roots(
     }
 
     let _interrupt = SurviveInterrupt::install();
-    let session_dir = crate::session::create_session_dir("mbx-session-")?;
+    let session_dir = crate::session::create_session_dir(crate::session::SESSION_DIR_PREFIX)?;
     let launch = super::launch::Launch::prepare(arguments, session_dir.path())?;
     let test_runner = super::test_runner::TestRunner::prepare(
         config,
