@@ -2880,3 +2880,234 @@ fn a_dry_run_counts_results_whose_output_tree_would_lose_a_file() {
             .is_some()
     );
 }
+
+/// Publish a rustc result whose action descriptor names `version`.
+fn store_rustc_result(store: &Path, version: &str, output: &[u8]) -> (CacheDigest, CacheDigest) {
+    let descriptor = serde_json::json!({
+        "kind": "rustc",
+        "compiler": { "rustc_version": version },
+        "arguments": [output],
+    });
+    let output = store_object(store, output);
+    let action = store_result(
+        store,
+        &descriptor.to_string(),
+        std::slice::from_ref(&output),
+    );
+    (action, output)
+}
+
+fn age_result(store: &Path, action: &CacheDigest, age: Duration) {
+    let path = LocalActionCache::new(store).path_for(action).unwrap();
+    let time = filetime::FileTime::from_system_time(SystemTime::now() - age);
+    filetime::set_file_times(path, time, time).unwrap();
+}
+
+const DAY: Duration = Duration::from_secs(86_400);
+
+#[test]
+fn a_compiler_version_unused_past_the_window_is_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, old_output) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old output");
+    let (new, new_output) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new output");
+    age_result(dir.path(), &old, 100 * DAY);
+
+    let outcome = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(outcome.removed_objects >= 1);
+    let cas = LocalCas::new(dir.path());
+    assert!(read_action_result(dir.path(), &old).is_none());
+    assert!(!cas.path_for(&old_output).unwrap().exists());
+    assert!(read_action_result(dir.path(), &new).is_some());
+    assert!(cas.path_for(&new_output).unwrap().exists());
+}
+
+#[test]
+fn a_recently_used_compiler_version_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old output");
+    let (new, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new output");
+    age_result(dir.path(), &old, 10 * DAY);
+    age_result(dir.path(), &new, 100 * DAY);
+
+    // The older version was used 10 days ago, so it is in use. The newer
+    // one has been idle past the window and is not the most recently used.
+    let outcome = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(read_action_result(dir.path(), &old).is_some());
+    assert!(read_action_result(dir.path(), &new).is_none());
+}
+
+#[test]
+fn one_recent_result_keeps_the_whole_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"a");
+    let (b, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"b");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"c");
+    age_result(dir.path(), &a, 200 * DAY);
+    age_result(dir.path(), &b, DAY);
+
+    let outcome = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 0);
+    assert!(read_action_result(dir.path(), &a).is_some());
+}
+
+#[test]
+fn the_newest_version_survives_even_when_everything_is_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old");
+    let (new, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new");
+    age_result(dir.path(), &old, 300 * DAY);
+    age_result(dir.path(), &new, 200 * DAY);
+
+    gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert!(read_action_result(dir.path(), &old).is_none());
+    assert!(read_action_result(dir.path(), &new).is_some());
+}
+
+#[test]
+fn an_object_shared_with_a_kept_version_is_not_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, shared) = store_rustc_result(dir.path(), "rustc 1.80.0", b"shared output");
+    let (new, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"shared output");
+    age_result(dir.path(), &old, 100 * DAY);
+
+    gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert!(read_action_result(dir.path(), &new).is_some());
+    assert!(
+        LocalCas::new(dir.path())
+            .path_for(&shared)
+            .unwrap()
+            .exists()
+    );
+}
+
+#[test]
+fn results_without_a_rustc_version_are_never_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = store_object(dir.path(), b"object");
+    let other = store_result(dir.path(), "not a descriptor", &[output]);
+    age_result(dir.path(), &other, 400 * DAY);
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old");
+    let (new, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new");
+    age_result(dir.path(), &old, 300 * DAY);
+    let _ = new;
+
+    gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert!(read_action_result(dir.path(), &other).is_some());
+}
+
+#[test]
+fn a_dry_run_reports_the_stale_version_without_removing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new");
+    age_result(dir.path(), &old, 100 * DAY);
+
+    let outcome = gc_stale_compilers(dir.path(), 90 * DAY, true).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(read_action_result(dir.path(), &old).is_some());
+}
+
+#[test]
+fn sweeps_do_not_refresh_the_use_time_of_an_idle_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idle, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"idle");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"current");
+    age_result(dir.path(), &idle, 30 * DAY);
+    let path = LocalActionCache::new(dir.path()).path_for(&idle).unwrap();
+    let atime =
+        |path: &Path| filetime::FileTime::from_last_access_time(&std::fs::metadata(path).unwrap());
+    let before = atime(&path);
+
+    // Neither pass is allowed to count as a use, even where reads update atime.
+    gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+    gc(dir.path(), u64::MAX).unwrap();
+
+    assert_eq!(atime(&path), before);
+}
+
+#[test]
+fn a_dry_run_counts_the_stale_pass_and_the_budget_sweep_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old output");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new output");
+    age_result(dir.path(), &old, 100 * DAY);
+    let before = stats(dir.path()).unwrap().total_bytes();
+
+    let preview = gc_dry_run_after_stale(dir.path(), u64::MAX, 90 * DAY).unwrap();
+    assert_eq!(preview.removed_action_results, 1);
+    assert_eq!(preview.remaining_bytes, before - preview.removed_bytes);
+
+    // Over budget as well: the objects the first plan removed are not
+    // removed again by the second.
+    let tight = gc_dry_run_after_stale(dir.path(), 0, 90 * DAY).unwrap();
+    let stale = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+    let budget = gc(dir.path(), 0).unwrap();
+    assert_eq!(
+        tight.removed_bytes,
+        stale.removed_bytes + budget.removed_bytes
+    );
+    assert_eq!(
+        tight.removed_objects,
+        stale.removed_objects + budget.removed_objects
+    );
+}
+
+#[test]
+fn a_pending_grouped_export_keeps_its_stale_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (old, old_output) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old output");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new output");
+    age_result(dir.path(), &old, 100 * DAY);
+    record_build_in_group(
+        dir.path(),
+        &"a".repeat(64),
+        workspace.path(),
+        std::slice::from_ref(&old),
+        Some("ci-job"),
+    );
+
+    let outcome = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 0);
+    assert!(read_action_result(dir.path(), &old).is_some());
+    assert!(
+        LocalCas::new(dir.path())
+            .path_for(&old_output)
+            .unwrap()
+            .exists()
+    );
+}
+
+#[test]
+fn a_dry_run_after_stale_does_not_walk_trees_a_real_run_would_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, _) = store_rustc_result(dir.path(), "rustc 1.80.0", b"old output");
+    let (_, _) = store_rustc_result(dir.path(), "rustc 1.90.0", b"new output");
+    age_result(dir.path(), &old, 100 * DAY);
+    // A surviving result whose output file is gone, as an interrupted
+    // collection leaves behind.
+    let lost = store_object(dir.path(), b"lost output");
+    let broken = store_result(dir.path(), "broken", std::slice::from_ref(&lost));
+    std::fs::remove_file(LocalCas::new(dir.path()).path_for(&lost).unwrap()).unwrap();
+
+    let preview = gc_dry_run_after_stale(dir.path(), u64::MAX, 90 * DAY).unwrap();
+    let stale = gc_stale_compilers(dir.path(), 90 * DAY, false).unwrap();
+    let real = gc(dir.path(), u64::MAX).unwrap();
+
+    assert_eq!(preview.removed_action_results, 1);
+    assert_eq!(
+        preview.removed_action_results,
+        stale.removed_action_results + real.removed_action_results
+    );
+    assert!(read_action_result(dir.path(), &broken).is_some());
+}

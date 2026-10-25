@@ -1708,12 +1708,12 @@ fn checkout_record_path(store: &Path, identity: &str, workspace_root: &Path) -> 
 /// the mount records one, so the ordering is an approximation either way.
 /// Evicting a live object costs a recompile, never correctness.
 pub fn gc(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
-    gc_with_mode(store, max_bytes, false)
+    gc_with_mode(store, max_bytes, false, HashSet::new())
 }
 
 /// Describe the collection `gc` would perform without changing the store.
 pub fn gc_dry_run(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
-    gc_with_mode(store, max_bytes, true)
+    gc_with_mode(store, max_bytes, true, HashSet::new())
 }
 
 #[cfg(test)]
@@ -1727,9 +1727,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome> {
+/// `already_removed` names paths an earlier dry-run pass planned to delete;
+/// they are treated as gone, so the two plans describe one collection.
+fn gc_with_mode(
+    store: &Path,
+    max_bytes: u64,
+    dry_run: bool,
+    already_removed: HashSet<PathBuf>,
+) -> Result<GcOutcome> {
     let mut objects = walk_files(&store.join(CAS_DIR))?;
-    let results = walk_files(&store.join(ACTION_RESULTS_DIR))?;
+    let mut results = walk_files(&store.join(ACTION_RESULTS_DIR))?;
+    objects.retain(|entry| !already_removed.contains(&entry.path));
+    results.retain(|entry| !already_removed.contains(&entry.path));
     let mut live_bytes = objects
         .iter()
         .chain(results.iter())
@@ -1752,7 +1761,7 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
         }
     }
 
-    let mut virtually_removed = HashSet::new();
+    let mut virtually_removed = already_removed;
     if live_bytes > max_bytes {
         // Reachability costs a read per action result and per output tree, so
         // it is computed only when something is actually about to be evicted.
@@ -1793,7 +1802,11 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
     // Walking each result's output tree costs a read per tree blob and a stat
     // per file, so it is done only when this sweep evicted something. That is
     // the moment a tree can have lost a file while its own object survived.
-    let walk_trees = outcome.removed_objects > 0 || !virtually_removed.is_empty();
+    //
+    // Only this call's own evictions count, in a dry run too: objects a stale
+    // pass planned to drop are accounted for by that pass, and a real run has
+    // already deleted them, so neither makes this sweep walk trees.
+    let walk_trees = outcome.removed_objects > 0;
     let cas = LocalCas::new(store);
     let mut trees = HashMap::new();
     for entry in &results {
@@ -1893,6 +1906,168 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
 
     outcome.remaining_bytes = live_bytes;
     Ok(outcome)
+}
+
+/// Drop cached compilations for Rust compiler versions that have gone unused.
+///
+/// A new compiler never reuses what an older one cached, so after an upgrade
+/// the old version's results only occupy disk. Each action result is
+/// attributed to the compiler version recorded in its action descriptor. A
+/// version counts as in use while any of its results was used within
+/// `max_age`; the rest are removed together with the objects only they
+/// reach. The most recently used version is always kept, so a store that has
+/// sat idle for longer than `max_age` is not emptied wholesale.
+///
+/// Results that cannot be attributed (other languages' actions, unreadable
+/// descriptors) are never touched. Use is read from the result file's access
+/// time where the filesystem records it, else its modification time.
+pub fn gc_stale_compilers(store: &Path, max_age: Duration, dry_run: bool) -> Result<GcOutcome> {
+    stale_compilers_pass(store, max_age, dry_run).map(|(outcome, _)| outcome)
+}
+
+/// Describe what `gc_stale_compilers` followed by `gc_dry_run` would remove,
+/// counting nothing twice and measuring the budget after the stale pass.
+pub fn gc_dry_run_after_stale(
+    store: &Path,
+    max_bytes: u64,
+    max_age: Duration,
+) -> Result<GcOutcome> {
+    let (mut stale, planned) = stale_compilers_pass(store, max_age, true)?;
+    let budget = gc_with_mode(store, max_bytes, true, planned)?;
+    stale.removed_objects += budget.removed_objects;
+    stale.removed_action_results += budget.removed_action_results;
+    stale.removed_checkout_records += budget.removed_checkout_records;
+    stale.removed_session_streams += budget.removed_session_streams;
+    stale.removed_bytes += budget.removed_bytes;
+    stale.remaining_bytes = budget.remaining_bytes;
+    Ok(stale)
+}
+
+/// The paths a pass removed, or in a dry run would remove.
+fn stale_compilers_pass(
+    store: &Path,
+    max_age: Duration,
+    dry_run: bool,
+) -> Result<(GcOutcome, HashSet<PathBuf>)> {
+    struct Attributed {
+        entry: Entry,
+        action: CacheDigest,
+    }
+
+    let cas = LocalCas::new(store);
+    let mut by_version: BTreeMap<String, Vec<Attributed>> = BTreeMap::new();
+    let mut unattributed = Vec::new();
+    for entry in walk_files(&store.join(ACTION_RESULTS_DIR))? {
+        let result = read_result_untouched(&entry.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RemoteActionResult>(&bytes).ok());
+        let Some(result) = result else {
+            continue;
+        };
+        match rustc_version_of(&cas, &result.action) {
+            Some(version) => by_version.entry(version).or_default().push(Attributed {
+                entry,
+                action: result.action,
+            }),
+            None => unattributed.push(result.action),
+        }
+    }
+
+    let last_used = |results: &[Attributed]| results.iter().map(|r| r.entry.used).max();
+    let newest = by_version
+        .iter()
+        .max_by_key(|(_, results)| last_used(results))
+        .map(|(version, _)| version.clone());
+    let cutoff = SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut outcome = GcOutcome::default();
+    let mut stale = Vec::new();
+    let mut kept_actions = unattributed;
+    for (version, results) in by_version {
+        let idle = last_used(&results).is_some_and(|used| used < cutoff);
+        if idle && Some(&version) != newest.as_ref() {
+            stale.extend(results);
+        } else {
+            kept_actions.extend(results.into_iter().map(|r| r.action));
+        }
+    }
+    // A grouped CI export deliberately retains its actions until the post-job
+    // step runs, whatever compiler made them. Those are never stale.
+    let pending = grouped_receipt_actions(store)?;
+    let (pinned, stale): (Vec<_>, Vec<_>) =
+        stale.into_iter().partition(|r| pending.contains(&r.action));
+    kept_actions.extend(pinned.into_iter().map(|r| r.action));
+    let mut planned = HashSet::new();
+    if stale.is_empty() {
+        return Ok((outcome, planned));
+    }
+
+    let doomed = rooted_action_objects(store, stale.iter().map(|r| r.action.clone()));
+    let kept = rooted_action_objects(store, kept_actions);
+    for result in &stale {
+        if dry_run || matches!(remove(&result.entry.path)?, Removal::Removed) {
+            outcome.removed_action_results += 1;
+            outcome.removed_bytes += result.entry.size;
+            planned.insert(result.entry.path.clone());
+        }
+    }
+    for path in doomed.difference(&kept) {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if dry_run || matches!(remove(path)?, Removal::Removed) {
+            outcome.removed_objects += 1;
+            outcome.removed_bytes += metadata.len();
+            planned.insert(path.clone());
+        }
+    }
+    Ok((outcome, planned))
+}
+
+/// Read a cache file without advancing the access time sweeps treat as use.
+///
+/// Maintenance passes read every result. Where the filesystem records access
+/// times, that would make each sweep look like a use and an idle compiler
+/// version would never age out. On Linux the file is opened with `O_NOATIME`,
+/// which leaves the time alone without touching it afterwards, so a build's
+/// concurrent hit is never overwritten. Elsewhere, or when the kernel refuses
+/// the flag for a file the caller does not own, the time seen before the read
+/// is put back; that can lose a hit that lands inside the read.
+fn read_result_untouched(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            return Ok(bytes);
+        }
+    }
+    let before = std::fs::metadata(path)?;
+    let bytes = std::fs::read(path)?;
+    let _ = filetime::set_file_atime(path, filetime::FileTime::from_last_access_time(&before));
+    Ok(bytes)
+}
+
+/// The compiler version a rustc action descriptor was keyed under.
+fn rustc_version_of(cas: &LocalCas, action: &CacheDigest) -> Option<String> {
+    let bytes = read_result_untouched(&cas.path_for(action).ok()?).ok()?;
+    let descriptor: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if descriptor.get("kind")?.as_str()? != "rustc" {
+        return None;
+    }
+    Some(
+        descriptor
+            .pointer("/compiler/rustc_version")?
+            .as_str()?
+            .to_owned(),
+    )
 }
 
 /// Discard import staging trees that a killed process left behind.
@@ -2388,7 +2563,7 @@ fn read_action_result(store: &Path, action: &CacheDigest) -> Option<RemoteAction
     let path = mbx_cache_core::LocalActionCache::new(store)
         .path_for(action)
         .ok()?;
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_result_untouched(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -2528,7 +2703,7 @@ fn action_result_is_dangling(
     walk_tree: bool,
     trees: &mut HashMap<CacheDigest, bool>,
 ) -> Result<bool> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_result_untouched(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {

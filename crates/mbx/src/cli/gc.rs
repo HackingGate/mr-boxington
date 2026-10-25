@@ -177,10 +177,22 @@ pub(super) fn run(
         crate::scheduler::prune_flights(&config.cache_dir);
         crate::scheduler::prune_test_history(&config.cache_dir);
     }
-    let outcome = if dry_run {
-        store::gc_dry_run(&store, store_budget)
-    } else {
-        store::gc(&store, store_budget)
+    // The stale-compiler pass runs first and deletes for real, so a budget
+    // sweep that fails afterwards must still get credit for what it freed.
+    let (outcome, stale_bytes) = match (dry_run, retention.rustc_max_age) {
+        (true, Some(max_age)) => (
+            store::gc_dry_run_after_stale(&store, store_budget, max_age),
+            0,
+        ),
+        (true, None) => (store::gc_dry_run(&store, store_budget), 0),
+        (false, _) => {
+            let stale = stale_compilers(&store, retention, false);
+            let stale_bytes = stale.removed_bytes;
+            (
+                store::gc(&store, store_budget).map(|outcome| with_stale_compilers(stale, outcome)),
+                stale_bytes,
+            )
+        }
     };
     // Independent collections: a broken action store must not prevent the
     // command from freeing the usually much larger target directories.
@@ -213,7 +225,8 @@ pub(super) fn run(
             let low_store_bytes = low_disk
                 .store
                 .as_ref()
-                .map_or(0, |outcome| outcome.removed_bytes);
+                .map_or(0, |outcome| outcome.removed_bytes)
+                .saturating_add(stale_bytes);
             freed_bytes = freed_bytes.saturating_add(low_disk.freed_target_bytes);
             record_collection(&store, low_store_bytes, freed_bytes, dry_run);
             if !json {
@@ -637,6 +650,29 @@ pub(super) fn target_removals(outcome: &target::CollectionOutcome, dry_run: bool
 ///
 /// Shared so the explicit command and the automatic sweep cannot drift into
 /// describing the same outcome two different ways.
+/// Drop the results of compiler versions `gc.rustc_max_age` has aged out.
+///
+/// Failure is logged and forgotten: the budget sweep that follows is the
+/// store's main collection and must still run.
+fn stale_compilers(store: &Path, retention: &RetentionSettings, dry_run: bool) -> store::GcOutcome {
+    let Some(max_age) = retention.rustc_max_age else {
+        return store::GcOutcome::default();
+    };
+    store::gc_stale_compilers(store, max_age, dry_run).unwrap_or_else(|error| {
+        log::warn!("stale compiler versions were not collected: {error}");
+        store::GcOutcome::default()
+    })
+}
+
+/// Fold the budget sweep's outcome into the stale-compiler pass that ran first.
+fn with_stale_compilers(
+    mut stale: store::GcOutcome,
+    outcome: store::GcOutcome,
+) -> store::GcOutcome {
+    add_gc_outcome(&mut stale, outcome);
+    stale
+}
+
 pub(super) fn evictions(outcome: &store::GcOutcome) -> String {
     format!(
         "evicted {} objects and {} action results ({} logical); {} logical remain",
@@ -709,11 +745,22 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
     let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
     crate::scheduler::prune_flights(&config.cache_dir);
     crate::scheduler::prune_test_history(&config.cache_dir);
+    let stale = stale_compilers(&config.store_dir(), retention, false);
     let outcome = match store::gc(&config.store_dir(), store_budget) {
-        Ok(outcome) => outcome,
+        Ok(outcome) => with_stale_compilers(stale, outcome),
         Err(error) => {
             log::warn!("the store was not swept: {error}");
-            store::GcOutcome::default()
+            // The budget sweep did not measure the store, so measure it here
+            // rather than report the empty default as what remains.
+            let remaining =
+                store::stats(&config.store_dir()).map_or(0, |stats| stats.total_bytes());
+            with_stale_compilers(
+                stale,
+                store::GcOutcome {
+                    remaining_bytes: remaining,
+                    ..store::GcOutcome::default()
+                },
+            )
         }
     };
     sweep.delta.freed_store_bytes = outcome.removed_bytes;
