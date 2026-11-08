@@ -1,13 +1,20 @@
 name: release-hg
 
-# The fork's release: Linux musl archives for x86_64 and aarch64 of a `v*-hg.*`
-# tag, with SHA256SUMS and a build provenance attestation.
+# The fork's release: Linux musl archives for x86_64 and aarch64 and a macOS
+# arm64 archive of a `v*-hg.*` tag, with SHA256SUMS and a build provenance
+# attestation.
 #
 # release.yml is upstream's and cannot run here: it needs upstream's Namespace
 # runners and Apple signing secrets, and attaches only once every target has
-# built. This file builds the two targets the fork's users install, on GitHub's
-# own runners, with release.yml's non-PGO musl build steps. It lives in a file
-# of its own so a rebase onto upstream never conflicts with it.
+# built. This file builds the three targets the fork's users install, on
+# GitHub's own runners, with release.yml's non-PGO build steps. It lives in a
+# file of its own so a rebase onto upstream never conflicts with it.
+#
+# The macOS binary is not Developer ID signed or notarized: the fork holds no
+# Apple identity. It carries the linker's ad-hoc signature and no hardened
+# runtime, so dyld keeps the DYLD_* variables cargo hands rustc's tools, which
+# is all upstream's entitlement restores. A tarball fetched by curl or mise is
+# never quarantined, so Gatekeeper does not ask for a ticket.
 
 permissions: {}
 
@@ -65,6 +72,8 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,6 +94,7 @@ jobs:
           cp target/mbx-bootstrap-build/debug/mbx target/mbx-bootstrap/mbx
 
       - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -118,7 +128,7 @@ jobs:
 
   release:
     name: Publish release
-    # Needs both targets: a fork release missing one is the gap this file closes.
+    # Needs every target: a fork release missing one is the gap this file closes.
     needs: [source, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -138,8 +148,8 @@ jobs:
           cd release-assets
           sha256sum -- *.tar.gz > SHA256SUMS
           cat SHA256SUMS
-          [ "$(wc -l < SHA256SUMS)" -eq 2 ] || {
-            echo "::error::expected two archives"; exit 1; }
+          [ "$(wc -l < SHA256SUMS)" -eq 3 ] || {
+            echo "::error::expected three archives"; exit 1; }
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -156,7 +166,7 @@ jobs:
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$REPO" --draft --verify-tag \
               --title "mbx $TAG" \
-              --notes "Upstream ${TAG%-hg.*} with the fork's patches. Linux musl builds for x86_64 and aarch64."
+              --notes "Upstream ${TAG%-hg.*} with the fork's patches. Linux musl builds for x86_64 and aarch64, and a macOS arm64 build (ad-hoc signed, not notarized)."
           fi
           if [[ $(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft) != true ]]; then
             echo "::error::refusing to change published release $TAG"
